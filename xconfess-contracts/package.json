@@ -4,8 +4,8 @@
   "private": true,
   "description": "NPM shim for building/testing xconfess Soroban contracts from the monorepo root.",
   "scripts": {
-    "build": "cargo build --workspace --target wasm32-unknown-unknown",
-    "build:release": "cargo build --workspace --release --target wasm32-unknown-unknown",
+    "build": "node init && cargo build --workspace --target wasm32-unknown-unknown",
+    "build:release": "node init && cargo build --workspace --release --target wasm32-unknown-unknown",
     "test": "cargo test --workspace",
     "test:integration": "cargo test --workspace",
     "contract:test:integration": "cargo test --test integration -p confession-anchor -- --nocapture",
@@ -23,4 +23,3 @@
     "node": ">=18"
   }
 }
-
