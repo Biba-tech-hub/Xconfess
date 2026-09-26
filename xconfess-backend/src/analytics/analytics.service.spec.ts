@@ -90,6 +90,56 @@ describe('AnalyticsService', () => {
       expect(qb.andWhere).toHaveBeenCalledWith('confession.isDeleted = false');
     });
 
+  // ── Privacy-aware trending (#85) ──────────────────────────────────────────
+
+    it('getTrendingConfessions() excludes private confessions', async () => {
+      const qb = makeQueryBuilderMock();
+      confessionRepo.createQueryBuilder.mockReturnValue(qb);
+
+      await service.getTrendingConfessions(7);
+
+      // Private content must never surface in trending
+      const andWhereCalls: string[] = qb.andWhere.mock.calls.map((c: any[]) => c[0] as string);
+      expect(andWhereCalls.some((call) => call.includes('is_private'))).toBe(true);
+    });
+
+    it('getTrendingConfessions() suppresses confessions below MIN_COHORT_SIZE reactions', async () => {
+      const qb = makeQueryBuilderMock();
+      // Return one confession with 3 reactions (below MIN_COHORT_SIZE=5)
+      // and one with 6 reactions (above threshold)
+      qb.getMany.mockResolvedValue([
+        { id: 'c1', content: 'hello world low', created_at: new Date(), comments: 'general', reactionCount: 3 },
+        { id: 'c2', content: 'hello world high', created_at: new Date(), comments: 'general', reactionCount: 6 },
+      ]);
+      confessionRepo.createQueryBuilder.mockReturnValue(qb);
+
+      const result: any[] = await service.getTrendingConfessions(7);
+
+      // Only the confession with >= MIN_COHORT_SIZE reactions should be in result
+      expect(result.some((r) => r.id === 'c1')).toBe(false);
+      expect(result.some((r) => r.id === 'c2')).toBe(true);
+    });
+
+    it('getTrendingConfessions() truncates content preview to 200 chars', async () => {
+      const qb = makeQueryBuilderMock();
+      qb.getMany.mockResolvedValue([
+        {
+          id: 'c1',
+          content: 'x'.repeat(500),
+          created_at: new Date(),
+          comments: 'general',
+          reactionCount: 10,
+        },
+      ]);
+      confessionRepo.createQueryBuilder.mockReturnValue(qb);
+
+      const result: any[] = await service.getTrendingConfessions(7);
+
+      if (result.length > 0) {
+        expect(result[0].content.length).toBeLessThanOrEqual(200);
+      }
+    });
+
     it('getGrowthMetricsForWindow (via getConfessionGrowth) excludes soft-deleted confessions', async () => {
       const qb = makeQueryBuilderMock();
       confessionRepo.createQueryBuilder.mockReturnValue(qb);

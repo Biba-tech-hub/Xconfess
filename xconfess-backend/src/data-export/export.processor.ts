@@ -43,7 +43,20 @@ export class ExportProcessor extends WorkerHost {
       // Stamp processingAt and flip status to PROCESSING
       await this.dataExportService.markExportProcessing(requestId);
 
+      // Issue #106: check for cancellation before doing expensive work
+      if (await this.dataExportService.isExportCancelled(requestId)) {
+        this.logger.log(`Export ${requestId} was cancelled before processing started.`);
+        return;
+      }
+
       const data = await this.dataExportService.compileUserData(userId);
+
+      // Issue #106: second cancellation checkpoint — after compilation, before writes
+      if (await this.dataExportService.isExportCancelled(requestId)) {
+        this.logger.log(`Export ${requestId} cancelled after data compilation.`);
+        return;
+      }
+
       const result = await this.generateChunkedZip(requestId, data);
 
       await this.exportRepository.update(requestId, {

@@ -2,6 +2,8 @@
 
 When reporting bugs or asking for help, logs are invaluable. However, logs often contain sensitive data that must be redacted before sharing.
 
+> **New to debugging locally?** See [LOCAL_OBSERVABILITY_GUIDE.md](./LOCAL_OBSERVABILITY_GUIDE.md) for step-by-step instructions on capturing logs, infrastructure state, and building a minimal reproduction bundle.
+
 ## What to redact
 
 Always remove or replace the following before pasting logs:

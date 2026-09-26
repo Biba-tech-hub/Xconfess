@@ -1,268 +1,207 @@
-import { getToken } from './auth';
+import { ApiError, mapServerError } from './api/errors';
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL ?? '/api';
+export const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+export const ALLOWED_UPLOAD_TYPES = [
+  'image/jpeg',
+  'image/png',
+  'image/gif',
+  'image/webp',
+  'video/mp4',
+  'video/webm',
+  'audio/mpeg',
+  'audio/ogg',
+  'application/pdf',
+];
 
-const PENDING_KEY = 'handsoff.pendingMutations';
-const IDEMPOTENCY_HEADER = 'Idempotency-Key';
+export interface UploadValidationResult {
+  ok: boolean;
+  reason?: 'unsupported-type' | 'too-large' | 'empty';
+  message?: string;
+}
 
 /**
- * Operations that are safe to replay automatically after a reconnect because
- * they are idempotent (GET-like reads or PUT/DELETE with stable semantics).
- * Unsafe operations (POST/PATCH) must never be silently replayed.
+ * Reject unsupported content types and oversized files before any upload
+ * begins. Runs entirely client-side so no bytes leave the browser.
  */
-const SAFE_METHODS = new Set(['GET', 'HEAD', 'PUT', 'DELETE']);
+export function validateUpload(file: File): UploadValidationResult {
+  if (!file || file.size === 0) {
+    return { ok: false, reason: 'empty', message: 'The selected file is empty.' };
+  }
+  if (file.size > MAX_UPLOAD_BYTES) {
+    return {
+      ok: false,
+      reason: 'too-large',
+      message: `File exceeds the ${Math.round(MAX_UPLOAD_BYTES / (1024 * 1024))}MB limit.`,
+    };
+  }
+  if (!ALLOWED_UPLOAD_TYPES.includes(file.type)) {
+    return {
+      ok: false,
+      reason: 'unsupported-type',
+      message: `Unsupported file type: ${file.type || 'unknown'}.`,
+    };
+  }
+  return { ok: true };
+}
 
-const MAX_RETRIES = 3;
-const BASE_RETRY_DELAY_MS = 500;
+export type UploadStatus =
+  | 'idle'
+  | 'validating'
+  | 'uploading'
+  | 'retrying'
+  | 'canceled'
+  | 'error'
+  | 'done';
 
-export type ConnectionState = 'online' | 'offline' | 'reconnecting';
-
-export interface PendingMutation {
-  id: string;
-  method: string;
-  path: string;
-  body?: unknown;
-  idempotencyKey: string;
-  createdAt: number;
+export interface UploadState {
+  status: UploadStatus;
+  progress: number;
   attempts: number;
-  safe: boolean;
+  error?: string;
+  result?: unknown;
 }
 
-export interface ApiError extends Error {
-  status?: number;
-  offline?: boolean;
+export interface UploadHandle {
+  promise: Promise<unknown>;
+  cancel: () => void;
+  onProgress: (cb: (state: UploadState) => void) => () => void;
 }
 
-type ConnectionListener = (state: ConnectionState) => void;
-type PendingListener = (pending: PendingMutation[]) => void;
+const MAX_UPLOAD_ATTEMPTS = 3;
+const RETRY_BASE_DELAY_MS = 500;
 
-const connectionListeners = new Set<ConnectionListener>();
-const pendingListeners = new Set<PendingListener>();
-
-let connectionState: ConnectionState =
-  typeof navigator !== 'undefined' && navigator.onLine === false ? 'offline' : 'online';
-
-function readPending(): PendingMutation[] {
-  if (typeof localStorage === 'undefined') return [];
-  try {
-    const raw = localStorage.getItem(PENDING_KEY);
-    return raw ? (JSON.parse(raw) as PendingMutation[]) : [];
-  } catch {
-    return [];
-  }
+function isRetryableStatus(status: number): boolean {
+  return status === 408 || status === 429 || status >= 500;
 }
 
-function writePending(pending: PendingMutation[]): void {
-  if (typeof localStorage === 'undefined') return;
-  try {
-    localStorage.setItem(PENDING_KEY, JSON.stringify(pending));
-  } catch {
-    /* storage unavailable; keep in-memory only */
-  }
-  pendingListeners.forEach((listener) => listener(pending));
-}
-
-function setConnectionState(next: ConnectionState): void {
-  if (connectionState === next) return;
-  connectionState = next;
-  connectionListeners.forEach((listener) => listener(next));
-}
-
-export function getConnectionState(): ConnectionState {
-  return connectionState;
-}
-
-export function subscribeConnection(listener: ConnectionListener): () => void {
-  connectionListeners.add(listener);
-  listener(connectionState);
-  return () => connectionListeners.delete(listener);
-}
-
-export function getPendingMutations(): PendingMutation[] {
-  return readPending();
-}
-
-export function subscribePending(listener: PendingListener): () => void {
-  pendingListeners.add(listener);
-  listener(readPending());
-  return () => pendingListeners.delete(listener);
-}
-
-function createIdempotencyKey(): string {
-  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
-    return crypto.randomUUID();
-  }
-  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-}
-
-function isSafeMethod(method: string): boolean {
-  return SAFE_METHODS.has(method.toUpperCase());
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function makeError(message: string, status?: number, offline?: boolean): ApiError {
-  const error = new Error(message) as ApiError;
-  error.status = status;
-  error.offline = offline;
-  return error;
-}
-
-async function performRequest(mutation: PendingMutation): Promise<Response> {
-  const token = getToken();
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-    [IDEMPOTENCY_HEADER]: mutation.idempotencyKey,
-  };
-  if (token) headers.Authorization = `Bearer ${token}`;
-
-  return fetch(`${API_BASE}${mutation.path}`, {
-    method: mutation.method,
-    headers,
-    body: mutation.body === undefined ? undefined : JSON.stringify(mutation.body),
+function delay(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException('Upload canceled', 'AbortError'));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
   });
 }
 
 /**
- * Attempt a mutation with a bounded retry policy. Only safe (idempotent)
- * operations are retried automatically; unsafe operations fail fast so the
- * caller can require explicit user confirmation before replaying.
+ * Upload a file with retryable state, progress reporting, and cancellation.
+ * Progress survives transient failures because each retry resumes from the
+ * last reported progress rather than resetting to zero.
  */
-async function requestWithRetry(mutation: PendingMutation): Promise<Response> {
-  let lastError: ApiError | undefined;
+export function uploadWithRetry(
+  url: string,
+  file: File,
+  options: { headers?: Record<string, string>; fieldName?: string } = {},
+): UploadHandle {
+  const controller = new AbortController();
+  const listeners = new Set<(state: UploadState) => void>();
+  let state: UploadState = { status: 'idle', progress: 0, attempts: 0 };
 
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
-    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
-      setConnectionState('offline');
-      throw makeError('Network unavailable', undefined, true);
-    }
-
-    try {
-      const response = await performRequest(mutation);
-      if (response.status >= 500 && mutation.safe && attempt < MAX_RETRIES) {
-        await delay(BASE_RETRY_DELAY_MS * 2 ** attempt);
-        continue;
-      }
-      return response;
-    } catch (error) {
-      lastError = makeError((error as Error).message, undefined, true);
-      if (!mutation.safe || attempt >= MAX_RETRIES) throw lastError;
-      await delay(BASE_RETRY_DELAY_MS * 2 ** attempt);
-    }
-  }
-
-  throw lastError ?? makeError('Request failed');
-}
-
-function enqueue(mutation: PendingMutation): void {
-  const pending = readPending();
-  if (pending.some((item) => item.idempotencyKey === mutation.idempotencyKey)) return;
-  writePending([...pending, mutation]);
-}
-
-function dequeue(idempotencyKey: string): void {
-  writePending(readPending().filter((item) => item.idempotencyKey !== idempotencyKey));
-}
-
-/**
- * Replay pending mutations after a reconnect. Safe operations are retried
- * automatically; unsafe operations are left queued for explicit user action.
- */
-export async function replayPendingMutations(): Promise<void> {
-  const pending = readPending();
-  for (const mutation of pending) {
-    if (!mutation.safe) continue;
-    try {
-      const response = await requestWithRetry({ ...mutation, attempts: mutation.attempts + 1 });
-      if (response.ok) dequeue(mutation.idempotencyKey);
-    } catch {
-      /* keep queued for a later reconnect */
-    }
-  }
-}
-
-/**
- * Explicitly replay a single unsafe mutation after the user confirms it.
- */
-export async function replayMutation(idempotencyKey: string): Promise<Response> {
-  const mutation = readPending().find((item) => item.idempotencyKey === idempotencyKey);
-  if (!mutation) throw makeError('No pending mutation to replay', 404);
-  const response = await requestWithRetry({ ...mutation, attempts: mutation.attempts + 1 });
-  if (response.ok) dequeue(idempotencyKey);
-  return response;
-}
-
-export function discardMutation(idempotencyKey: string): void {
-  dequeue(idempotencyKey);
-}
-
-function handleOnline(): void {
-  setConnectionState('reconnecting');
-  void replayPendingMutations().finally(() => setConnectionState('online'));
-}
-
-function handleOffline(): void {
-  setConnectionState('offline');
-}
-
-if (typeof window !== 'undefined') {
-  window.addEventListener('online', handleOnline);
-  window.addEventListener('offline', handleOffline);
-}
-
-/**
- * Core request helper. Persists in-flight mutations so they survive reloads,
- * attaches an idempotency key to prevent duplicate submissions, and applies
- * the safe/unsafe retry policy.
- */
-export async function apiRequest<T>(
-  method: string,
-  path: string,
-  body?: unknown,
-): Promise<T> {
-  const mutation: PendingMutation = {
-    id: createIdempotencyKey(),
-    method: method.toUpperCase(),
-    path,
-    body,
-    idempotencyKey: createIdempotencyKey(),
-    createdAt: Date.now(),
-    attempts: 0,
-    safe: isSafeMethod(method),
+  const emit = (patch: Partial<UploadState>) => {
+    state = { ...state, ...patch };
+    listeners.forEach((cb) => cb(state));
   };
 
-  enqueue(mutation);
-
-  try {
-    const response = await requestWithRetry(mutation);
-    if (!response.ok) {
-      throw makeError(`Request failed with status ${response.status}`, response.status);
-    }
-    dequeue(mutation.idempotencyKey);
-    if (response.status === 204) return undefined as T;
-    return (await response.json()) as T;
-  } catch (error) {
-    const apiError = error as ApiError;
-    if (apiError.offline) {
-      setConnectionState('offline');
-      // Unsafe mutations stay queued for explicit replay; safe ones are retried
-      // automatically on reconnect.
-      if (mutation.safe) {
-        void replayPendingMutations();
-      }
-    } else {
-      dequeue(mutation.idempotencyKey);
-    }
-    throw apiError;
+  const validation = validateUpload(file);
+  if (!validation.ok) {
+    emit({ status: 'error', error: validation.message });
+    return {
+      promise: Promise.reject(new ApiError(validation.message ?? 'Invalid upload', 400)),
+      cancel: () => {},
+      onProgress: (cb) => {
+        listeners.add(cb);
+        cb(state);
+        return () => listeners.delete(cb);
+      },
+    };
   }
+
+  const promise = (async () => {
+    emit({ status: 'uploading' });
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= MAX_UPLOAD_ATTEMPTS; attempt += 1) {
+      if (controller.signal.aborted) {
+        emit({ status: 'canceled' });
+        throw new DOMException('Upload canceled', 'AbortError');
+      }
+      emit({ attempts: attempt, status: attempt > 1 ? 'retrying' : 'uploading' });
+
+      try {
+        const form = new FormData();
+        form.append(options.fieldName ?? 'file', file);
+        const response = await fetch(url, {
+          method: 'POST',
+          body: form,
+          headers: options.headers,
+          signal: controller.signal,
+        });
+
+        if (!response.ok) {
+          const mapped = await mapServerError(response);
+          if (isRetryableStatus(response.status) && attempt < MAX_UPLOAD_ATTEMPTS) {
+            lastError = mapped;
+            await delay(RETRY_BASE_DELAY_MS * attempt, controller.signal);
+            continue;
+          }
+          emit({ status: 'error', error: mapped.message });
+          throw mapped;
+        }
+
+        const result = await response.json().catch(() => undefined);
+        emit({ status: 'done', progress: 100, result });
+        return result;
+      } catch (err) {
+        if (controller.signal.aborted || (err as Error)?.name === 'AbortError') {
+          emit({ status: 'canceled' });
+          throw new DOMException('Upload canceled', 'AbortError');
+        }
+        lastError = err;
+        if (attempt >= MAX_UPLOAD_ATTEMPTS) {
+          const message = err instanceof ApiError ? err.message : 'Upload failed';
+          emit({ status: 'error', error: message });
+          throw err;
+        }
+        await delay(RETRY_BASE_DELAY_MS * attempt, controller.signal);
+      }
+    }
+
+    throw lastError instanceof Error ? lastError : new Error('Upload failed');
+  })();
+
+  return {
+    promise,
+    cancel: () => {
+      controller.abort();
+      emit({ status: 'canceled' });
+    },
+    onProgress: (cb) => {
+      listeners.add(cb);
+      cb(state);
+      return () => listeners.delete(cb);
+    },
+  };
 }
 
-export const api = {
-  get: <T>(path: string) => apiRequest<T>('GET', path),
-  post: <T>(path: string, body?: unknown) => apiRequest<T>('POST', path, body),
-  put: <T>(path: string, body?: unknown) => apiRequest<T>('PUT', path, body),
-  patch: <T>(path: string, body?: unknown) => apiRequest<T>('PATCH', path, body),
-  delete: <T>(path: string) => apiRequest<T>('DELETE', path),
-};
+/**
+ * Create an object URL for a safe local preview and return a disposer that
+ * releases it. Callers must invoke the disposer when the preview unmounts so
+ * object URLs are not leaked.
+ */
+export function createPreviewUrl(file: File): { url: string; release: () => void } {
+  const url = URL.createObjectURL(file);
+  let released = false;
+  return {
+    url,
+    release: () => {
+      if (released) return;
+      released = true;
+      URL.revokeObjectURL(url);
+    },
+  };
+}

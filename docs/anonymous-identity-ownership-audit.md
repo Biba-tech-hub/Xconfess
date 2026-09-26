@@ -42,6 +42,44 @@ The default rule is:
   - Linked anonymous identities are rejected for anonymous callers with `404`.
   - Authenticated reports continue to bind to `reporterId`, not a body/header identity.
 
+## Username and Identity Enumeration Resistance
+
+Issue: #27
+
+Registration, login, recovery, and profile endpoints can reveal whether an identity exists through response differences, status codes, headers, or timing. The following rules normalize externally visible behavior while keeping internal logs useful.
+
+### Externally Visible Contract
+
+| Surface | Endpoint | Existing identity | Non-existing identity | Notes |
+| --- | --- | --- | --- | --- |
+| Registration | `POST /auth/register` | `201` generic success body | `201` generic success body | Duplicate registration must not confirm the account exists. If the email/username is taken, respond with the same shape and status as a fresh registration and notify the real owner out-of-band. |
+| Login | `POST /auth/login` | `200` with tokens | `401` generic `Invalid credentials` | Same status, body, and headers for unknown user, wrong password, and disabled account. |
+| Password recovery request | `POST /auth/recovery/request` | `202` generic accepted | `202` generic accepted | Always return the same body and status; never echo whether the identifier matched. |
+| Password recovery verify | `POST /auth/recovery/verify` | `200`/`400` based on token validity only | `400` generic invalid token | Token validity is the only signal; do not branch on whether the account exists. |
+| Profile lookup | `GET /users/:userId` | `200` public profile | `404` generic not found | `404` must not distinguish deleted, private, or never-existed accounts. |
+| Username availability | `GET /auth/username-available` | `200` `{ available: false }` | `200` `{ available: true }` | If this endpoint is exposed, it is an explicit product decision and must be rate limited; otherwise remove it. |
+
+### Timing Budget
+
+- Authentication and recovery handlers must run the same code path for existing and non-existing identities, including a constant-cost password hash comparison against a dummy hash when the user is missing.
+- Target budget: the difference in p95 latency between existing and non-existing identities must stay within 50 ms on the reference environment.
+- Timing tests assert the budget rather than exact equality to avoid flakiness on shared CI runners.
+
+### Internal Logging
+
+- Logs may record the outcome (`login_failed`, `recovery_requested`, `register_duplicate`) and a hashed identifier (`sha256(lowercased(identifier) + LOG_SALT)`).
+- Logs must not contain raw email addresses, usernames, or user IDs on enumeration-sensitive paths.
+- Operators can still correlate repeated attempts by the hashed identifier without exposing the underlying identity.
+
+### Regression Coverage
+
+- `src/auth/auth-enumeration.spec.ts`
+  - Registration returns identical status, body, and headers for new and duplicate identities.
+  - Login returns identical status, body, and headers for unknown user, wrong password, and disabled account.
+  - Recovery request returns identical status, body, and headers for existing and non-existing identities.
+  - Timing budget: p95 delta between existing and non-existing identities stays within 50 ms.
+  - Logs on enumeration-sensitive paths contain only hashed identifiers.
+
 ## Regression Coverage
 
 - `src/common/security/anonymous-identity-ownership.spec.ts`

@@ -367,3 +367,8 @@ When adding a new API endpoint, follow the [API endpoint contributor checklist](
 - `xconfess-frontend/README.md`
 - `xconfess-contracts/README.md`
 - `docs/message-e2e-encryption.md` — E2E private messaging protocol
+
+## Handsoff notes
+
+<!-- handsoff-issue-24 -->
+- #24: [Advanced] Add device and session management UI

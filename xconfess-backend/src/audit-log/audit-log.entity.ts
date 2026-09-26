@@ -137,6 +137,32 @@ export class AuditLog {
   @Column({ name: 'request_id', type: 'varchar', length: 64, nullable: true })
   requestId: string | null;
 
+  /**
+   * HMAC-SHA256 integrity tag over the canonical audit record fields.
+   *
+   * Computed at write time using APP_SECRET as the key.  A reader can
+   * recompute the HMAC and compare it to this column to detect whether a
+   * stored record has been tampered with outside the application layer.
+   *
+   * Fields covered: id, action, adminId, entityType, entityId, requestId,
+   * ipAddress, and the ISO createdAt timestamp.  The `metadata` and `notes`
+   * columns are intentionally excluded from the HMAC to allow safe
+   * administrative annotation of existing records without invalidating
+   * integrity tags; those fields are considered mutable context rather than
+   * immutable event facts.
+   *
+   * NULL when the record was created before this column was introduced or
+   * when APP_SECRET is not configured.
+   */
+  @Column({
+    name: 'integrity_hash',
+    type: 'varchar',
+    length: 64,
+    nullable: true,
+    comment: 'HMAC-SHA256 over canonical record fields for tamper detection',
+  })
+  integrityHash: string | null;
+
   @CreateDateColumn({ name: 'createdAt', type: 'timestamp with time zone' })
   createdAt: Date;
 

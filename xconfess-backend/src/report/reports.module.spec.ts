@@ -8,6 +8,7 @@ import { Report } from '../admin/entities/report.entity';
 import { AnonymousConfession } from '../confession/entities/confession.entity';
 import { OutboxEvent } from '../common/entities/outbox-event.entity';
 import { AnonymousUser } from '../user/entities/anonymous-user.entity';
+import { AnonymousUserService } from '../user/anonymous-user.service';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import { AuditLogModule } from '../audit-log/audit-log.module';
 import { AuthModule } from '../auth/auth.module';
@@ -25,6 +26,7 @@ async function compileReportTestingModule() {
     controllers: [ReportsController],
     providers: [
       ReportsService,
+      { provide: AnonymousUserService, useValue: { findByWalletAddress: jest.fn() } },
       { provide: getRepositoryToken(Report), useValue: mockRepository() },
       {
         provide: getRepositoryToken(AnonymousConfession),

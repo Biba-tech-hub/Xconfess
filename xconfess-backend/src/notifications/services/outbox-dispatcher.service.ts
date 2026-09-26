@@ -185,12 +185,69 @@ export class OutboxDispatcherService {
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       this.logger.error(`Failed to dispatch event ${event.id}: ${message}`);
-      event.status = OutboxStatus.FAILED;
       event.retryCount += 1;
       event.lastError = message;
-      // Clear claiming info so it can be picked up later if timeout expires or immediately if retry logic allows
-      // Actually, standard retry logic will wait for the next cron.
+
+      const MAX_RETRIES = 5;
+      if (event.retryCount >= MAX_RETRIES) {
+        event.status = OutboxStatus.DEAD_LETTER;
+        this.logger.warn(
+          `Outbox event ${event.id} reached max retries (${MAX_RETRIES}) and was moved to DEAD_LETTER. Domain: ${event.domain || 'notification'}, Type: ${event.type}`,
+        );
+      } else {
+        event.status = OutboxStatus.FAILED;
+      }
+
       await this.outboxRepo.save(event);
     }
   }
+
+  @Cron(CronExpression.EVERY_DAY_AT_MIDNIGHT)
+  async cleanupCompletedEvents(retentionDays = 7): Promise<number> {
+    const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
+    const deleteResult = await this.outboxRepo
+      .createQueryBuilder()
+      .delete()
+      .from(OutboxEvent)
+      .where('status IN (:...statuses)', {
+        statuses: [OutboxStatus.COMPLETED, OutboxStatus.SKIPPED],
+      })
+      .andWhere('processedAt < :cutoff', { cutoff })
+      .execute();
+
+    const affected = deleteResult.affected || 0;
+    this.logger.log(`Outbox cleanup purged ${affected} completed/skipped events older than ${retentionDays} days`);
+    return affected;
+  }
+
+  async getOutboxMetrics(): Promise<{
+    pending: number;
+    processing: number;
+    failed: number;
+    deadLetter: number;
+    maxLagSeconds: number;
+  }> {
+    const pending = await this.outboxRepo.count({ where: { status: OutboxStatus.PENDING } });
+    const processing = await this.outboxRepo.count({ where: { status: OutboxStatus.PROCESSING } });
+    const failed = await this.outboxRepo.count({ where: { status: OutboxStatus.FAILED } });
+    const deadLetter = await this.outboxRepo.count({ where: { status: OutboxStatus.DEAD_LETTER } });
+
+    const oldestPending = await this.outboxRepo.findOne({
+      where: { status: OutboxStatus.PENDING },
+      orderBy: { createdAt: 'ASC' },
+    });
+
+    const maxLagSeconds = oldestPending
+      ? Math.max(0, Math.floor((Date.now() - oldestPending.createdAt.getTime()) / 1000))
+      : 0;
+
+    return {
+      pending,
+      processing,
+      failed,
+      deadLetter,
+      maxLagSeconds,
+    };
+  }
 }
+

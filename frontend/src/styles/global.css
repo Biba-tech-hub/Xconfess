@@ -1,0 +1,178 @@
+/* ==========================================================================
+   Design tokens
+   ========================================================================== */
+:root {
+  /* Motion tokens: durations and easings */
+  --motion-duration-instant: 0ms;
+  --motion-duration-fast: 120ms;
+  --motion-duration-base: 200ms;
+  --motion-duration-slow: 320ms;
+
+  --motion-ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --motion-ease-decelerate: cubic-bezier(0, 0, 0, 1);
+  --motion-ease-accelerate: cubic-bezier(0.3, 0, 1, 1);
+
+  /* Status colors: contrast-safe against --color-surface */
+  --color-surface: #ffffff;
+  --color-text: #1a1a1a;
+  --color-text-muted: #4a4a4a;
+
+  --color-status-success: #0f6b3a;
+  --color-status-warning: #8a5300;
+  --color-status-danger: #b3261e;
+  --color-status-info: #0b5cad;
+
+  --color-status-success-bg: #e6f4ec;
+  --color-status-warning-bg: #fdf3e0;
+  --color-status-danger-bg: #fbe9e7;
+  --color-status-info-bg: #e7f0fa;
+
+  --color-focus-ring: #0b5cad;
+}
+
+/* ==========================================================================
+   Base
+   ========================================================================== */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  line-height: 1.5;
+}
+
+/* ==========================================================================
+   Motion
+   ========================================================================== */
+.transition-base {
+  transition-property: background-color, border-color, color, opacity, transform;
+  transition-duration: var(--motion-duration-base);
+  transition-timing-function: var(--motion-ease-standard);
+}
+
+.transition-fast {
+  transition-property: background-color, border-color, color, opacity, transform;
+  transition-duration: var(--motion-duration-fast);
+  transition-timing-function: var(--motion-ease-standard);
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.spinner {
+  animation: spin var(--motion-duration-slow) linear infinite;
+}
+
+/* ==========================================================================
+   Reduced motion
+   Essential information must never depend on motion. When the user requests
+   reduced motion, animations snap to their end state instead of playing.
+   ========================================================================== */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: var(--motion-duration-instant) !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: var(--motion-duration-instant) !important;
+    scroll-behavior: auto !important;
+  }
+
+  .spinner {
+    /* Keep a static, non-animated affordance so status is still conveyed. */
+    animation: none !important;
+    border-top-color: var(--color-status-info);
+  }
+}
+
+/* ==========================================================================
+   Status
+   Status is conveyed by text/icon in markup, not color alone. Colors below
+   are contrast-safe against their backgrounds.
+   ========================================================================== */
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.125rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  border: 1px solid transparent;
+}
+
+.status__icon {
+  flex: none;
+  width: 1em;
+  height: 1em;
+}
+
+.status--success {
+  color: var(--color-status-success);
+  background: var(--color-status-success-bg);
+  border-color: var(--color-status-success);
+}
+
+.status--warning {
+  color: var(--color-status-warning);
+  background: var(--color-status-warning-bg);
+  border-color: var(--color-status-warning);
+}
+
+.status--danger {
+  color: var(--color-status-danger);
+  background: var(--color-status-danger-bg);
+  border-color: var(--color-status-danger);
+}
+
+.status--info {
+  color: var(--color-status-info);
+  background: var(--color-status-info-bg);
+  border-color: var(--color-status-info);
+}
+
+/* ==========================================================================
+   Focus visibility
+   ========================================================================== */
+:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+
+/* ==========================================================================
+   Forced colors (Windows High Contrast)
+   Rely on system colors so controls stay legible; drop decorative fills and
+   shadows that forced-colors would otherwise flatten unpredictably.
+   ========================================================================== */
+@media (forced-colors: active) {
+  .status {
+    border-color: currentColor;
+    background: Canvas;
+    color: CanvasText;
+  }
+
+  .status__icon {
+    /* Icons must remain visible; use the system text color. */
+    fill: currentColor;
+    forced-color-adjust: auto;
+  }
+
+  :focus-visible {
+    outline: 2px solid Highlight;
+    outline-offset: 2px;
+  }
+
+  .spinner {
+    border-color: CanvasText;
+    border-top-color: Highlight;
+  }
+}

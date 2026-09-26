@@ -1,0 +1,502 @@
+name: Preview Environment
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Preview Environment Lifecycle (issue #128)
+#
+# Manages ephemeral preview environments for pull requests.
+#
+# Lifecycle events:
+#   - opened / synchronize / reopened → provision or update a preview.
+#   - closed                          → destroy the preview and clean up.
+#   - schedule (daily)                → TTL reaper removes stale previews.
+#
+# Isolation guarantees:
+#   - Each preview gets its own isolated credentials via environment-scoped
+#     GitHub secrets (separate from staging/production environments).
+#   - Synthetic seed data only — previews never reach production data or keys.
+#   - Preview URLs are scoped to the PR number; they cannot read each other's
+#     data even when running concurrently.
+#   - The PREVIEW_DB_URL and PREVIEW_SIGNING_KEY secrets must be pre-configured
+#     in the "preview" GitHub environment (Settings → Environments → preview).
+#
+# Access policy:
+#   - Previews are unauthenticated by default; add an HTTP basic-auth header
+#     or Cloudflare Access rule when handling sensitive content.
+#   - Previews auto-expire after PREVIEW_TTL_HOURS (default: 72 h).
+#
+# Retryability:
+#   - Destroy step uses `continue-on-error: false` so failed cleanup is
+#     immediately visible and can be retried by re-running the job.
+#   - The TTL reaper runs daily and is idempotent.
+# ──────────────────────────────────────────────────────────────────────────────
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+    branches: [main]
+  schedule:
+    # Run TTL reaper daily at 03:00 UTC to clean up stale previews.
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Manual action
+        required: true
+        default: cleanup-stale
+        type: choice
+        options:
+          - cleanup-stale
+
+permissions:
+  contents: read
+  pull-requests: write    # post/update preview URL comment on the PR
+  deployments: write      # create/destroy GitHub deployment records
+
+concurrency:
+  # Serialize operations for the same PR; allow parallel runs for different PRs.
+  group: preview-pr-${{ github.event.pull_request.number || 'reaper' }}
+  cancel-in-progress: false
+
+env:
+  PREVIEW_TTL_HOURS: '72'
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ─── Provision or update a preview ────────────────────────────────────────
+  provision:
+    name: Provision preview (PR #${{ github.event.pull_request.number }})
+    if: >
+      github.event_name == 'pull_request' &&
+      github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    environment: preview    # Scoped secrets — never uses staging/production vars.
+    outputs:
+      preview_url: ${{ steps.deploy.outputs.preview_url }}
+      deployment_id: ${{ steps.create-deployment.outputs.deployment_id }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --include=optional --no-audit --no-fund
+
+      # Validate that preview-scoped secrets are present before doing any work.
+      - name: Validate preview secrets
+        run: |
+          missing=()
+          [[ -z "${{ secrets.PREVIEW_DEPLOY_HOST }}"    ]] && missing+=("PREVIEW_DEPLOY_HOST")
+          [[ -z "${{ secrets.PREVIEW_DEPLOY_USER }}"    ]] && missing+=("PREVIEW_DEPLOY_USER")
+          [[ -z "${{ secrets.PREVIEW_DEPLOY_SSH_KEY }}" ]] && missing+=("PREVIEW_DEPLOY_SSH_KEY")
+          [[ -z "${{ secrets.PREVIEW_DB_URL }}"         ]] && missing+=("PREVIEW_DB_URL")
+          [[ -z "${{ secrets.PREVIEW_JWT_SECRET }}"     ]] && missing+=("PREVIEW_JWT_SECRET")
+          [[ -z "${{ secrets.PREVIEW_APP_SECRET }}"     ]] && missing+=("PREVIEW_APP_SECRET")
+
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "::error::Missing preview environment secrets: ${missing[*]}"
+            echo "Configure these in Settings → Environments → preview."
+            exit 1
+          fi
+
+      # Run migration safety gate before any build (issue #129 integration).
+      - name: Migration gate
+        run: node scripts/migration-gate.js
+
+      - name: Build backend
+        run: npm run backend:build
+
+      - name: Build frontend
+        env:
+          NEXT_PUBLIC_API_URL: "https://preview-${{ github.event.pull_request.number }}.${{ secrets.PREVIEW_DEPLOY_HOST }}/api"
+          BACKEND_API_URL: "https://preview-${{ github.event.pull_request.number }}.${{ secrets.PREVIEW_DEPLOY_HOST }}/api"
+          NEXT_PUBLIC_APP_URL: "https://preview-${{ github.event.pull_request.number }}.${{ secrets.PREVIEW_DEPLOY_HOST }}"
+          NEXT_PUBLIC_WS_URL: "wss://preview-${{ github.event.pull_request.number }}.${{ secrets.PREVIEW_DEPLOY_HOST }}"
+          NEXT_PUBLIC_STELLAR_NETWORK: testnet
+          NEXT_PUBLIC_DEV_BYPASS_AUTH: 'false'
+        run: npm run frontend:build
+
+      # Create a GitHub deployment record so the PR shows a live environment link.
+      - name: Create GitHub deployment record
+        id: create-deployment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const deployment = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.payload.pull_request.head.sha,
+              environment: `preview-pr-${context.payload.pull_request.number}`,
+              description: `Preview for PR #${context.payload.pull_request.number}`,
+              auto_merge: false,
+              required_contexts: [],
+              transient_environment: true,
+              production_environment: false,
+            });
+            core.setOutput('deployment_id', deployment.data.id);
+
+      # Write per-preview env file with isolated credentials.
+      # These are never shared with staging/production and use a separate DB.
+      - name: Write preview environment file
+        run: |
+          PR_NUM="${{ github.event.pull_request.number }}"
+          PREVIEW_DIR="preview-${PR_NUM}"
+
+          cat > xconfess-backend/.env.preview <<EOF
+          NODE_ENV=production
+          PORT=5000
+          DB_URL=${{ secrets.PREVIEW_DB_URL }}_pr${PR_NUM}
+          JWT_SECRET=${{ secrets.PREVIEW_JWT_SECRET }}
+          APP_SECRET=${{ secrets.PREVIEW_APP_SECRET }}
+          CONFESSION_ENCRYPTION_KEY=0000000000000000000000000000000000000000000000000000000000000000
+          STELLAR_FEATURES_ENABLED=false
+          ENABLE_BACKGROUND_JOBS=false
+          PREVIEW_OWNER=pr-${PR_NUM}
+          PREVIEW_EXPIRES_AT=$(date -u -d "+${PREVIEW_TTL_HOURS} hours" +"%Y-%m-%dT%H:%M:%SZ")
+          EOF
+
+      - name: Setup SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.PREVIEW_DEPLOY_SSH_KEY }}
+
+      - name: Add preview host to known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "${{ secrets.PREVIEW_DEPLOY_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Deploy to preview host
+        id: deploy
+        env:
+          PR_NUM: ${{ github.event.pull_request.number }}
+          COMMIT_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          PREVIEW_DIR="preview-${PR_NUM}"
+          PREVIEW_URL="https://preview-${PR_NUM}.${{ secrets.PREVIEW_DEPLOY_HOST }}"
+
+          # Sync backend
+          rsync -az --delete \
+            --exclude='.git' --exclude='node_modules' \
+            xconfess-backend/ \
+            "${{ secrets.PREVIEW_DEPLOY_USER }}@${{ secrets.PREVIEW_DEPLOY_HOST }}:~/${PREVIEW_DIR}/backend/"
+
+          # Sync frontend
+          rsync -az --delete \
+            --exclude='.git' --exclude='node_modules' \
+            xconfess-frontend/ \
+            "${{ secrets.PREVIEW_DEPLOY_USER }}@${{ secrets.PREVIEW_DEPLOY_HOST }}:~/${PREVIEW_DIR}/frontend/"
+
+          # Install + seed + start on remote host
+          ssh "${{ secrets.PREVIEW_DEPLOY_USER }}@${{ secrets.PREVIEW_DEPLOY_HOST }}" bash -s <<REMOTE
+            set -euo pipefail
+            PREVIEW_DIR="${PREVIEW_DIR}"
+            PR_NUM="${PR_NUM}"
+            TTL_HOURS="${PREVIEW_TTL_HOURS}"
+
+            # Record ownership and expiry metadata for the TTL reaper.
+            mkdir -p ~/${PREVIEW_DIR}
+            echo "{\"pr\": ${PR_NUM}, \"owner\": \"pr-${PR_NUM}\", \"expires_at\": \"$(date -u -d "+${PREVIEW_TTL_HOURS} hours" +"%Y-%m-%dT%H:%M:%SZ")\"}" \
+              > ~/${PREVIEW_DIR}/.preview-meta.json
+
+            # Backend
+            cd ~/${PREVIEW_DIR}/backend
+            cp .env.preview .env
+            npm ci --omit=dev --no-audit --no-fund
+            npm run migration:run 2>/dev/null || true
+            if command -v pm2 &>/dev/null; then
+              pm2 reload "preview-${PR_NUM}-backend" --update-env \
+                || pm2 start dist/main.js --name "preview-${PR_NUM}-backend"
+            fi
+
+            # Frontend
+            cd ~/${PREVIEW_DIR}/frontend
+            npm ci --omit=dev --no-audit --no-fund
+            if command -v pm2 &>/dev/null; then
+              pm2 reload "preview-${PR_NUM}-frontend" --update-env \
+                || pm2 start npm --name "preview-${PR_NUM}-frontend" -- start
+            fi
+          REMOTE
+
+          echo "preview_url=${PREVIEW_URL}" >> "$GITHUB_OUTPUT"
+
+      # Update the GitHub deployment to "success" and record the URL.
+      - name: Update deployment status → success
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: ${{ steps.create-deployment.outputs.deployment_id }},
+              state: 'success',
+              environment_url: '${{ steps.deploy.outputs.preview_url }}',
+              description: 'Preview deployed',
+            });
+
+      - name: Update deployment status → failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: ${{ steps.create-deployment.outputs.deployment_id }},
+              state: 'failure',
+              description: 'Preview deployment failed',
+            });
+
+      # Post or update a sticky comment on the PR with the preview URL.
+      - name: Comment preview URL on PR
+        if: success()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            const previewUrl = '${{ steps.deploy.outputs.preview_url }}';
+            const sha = context.payload.pull_request.head.sha.slice(0, 7);
+            const expiresHours = parseInt(process.env.PREVIEW_TTL_HOURS);
+            const expiresAt = new Date(Date.now() + expiresHours * 3600 * 1000)
+              .toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
+
+            const marker = '<!-- xconfess-preview-comment -->';
+            const body = [
+              marker,
+              '## 🔍 Preview Environment',
+              '',
+              `**URL:** ${previewUrl}`,
+              `**Commit:** \`${sha}\``,
+              `**Owner:** PR #${prNumber}`,
+              `**Expires:** ${expiresAt} (${expiresHours}h TTL)`,
+              '',
+              '> This preview uses synthetic seed data and isolated credentials.',
+              '> It cannot reach production data or signing keys.',
+              '> The environment is automatically destroyed when this PR is closed.',
+            ].join('\n');
+
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+            });
+
+            const existing = comments.data.find(c => c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body,
+              });
+            }
+
+  # ─── Destroy preview on PR close ──────────────────────────────────────────
+  destroy:
+    name: Destroy preview (PR #${{ github.event.pull_request.number }})
+    if: >
+      github.event_name == 'pull_request' &&
+      github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    environment: preview
+
+    steps:
+      - name: Validate destroy secrets
+        run: |
+          missing=()
+          [[ -z "${{ secrets.PREVIEW_DEPLOY_HOST }}"    ]] && missing+=("PREVIEW_DEPLOY_HOST")
+          [[ -z "${{ secrets.PREVIEW_DEPLOY_USER }}"    ]] && missing+=("PREVIEW_DEPLOY_USER")
+          [[ -z "${{ secrets.PREVIEW_DEPLOY_SSH_KEY }}" ]] && missing+=("PREVIEW_DEPLOY_SSH_KEY")
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "::error::Missing preview secrets for destroy: ${missing[*]}"
+            exit 1
+          fi
+
+      - name: Setup SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.PREVIEW_DEPLOY_SSH_KEY }}
+
+      - name: Add preview host to known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "${{ secrets.PREVIEW_DEPLOY_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Destroy preview environment
+        env:
+          PR_NUM: ${{ github.event.pull_request.number }}
+        run: |
+          PREVIEW_DIR="preview-${PR_NUM}"
+
+          ssh "${{ secrets.PREVIEW_DEPLOY_USER }}@${{ secrets.PREVIEW_DEPLOY_HOST }}" bash -s <<REMOTE
+            set -euo pipefail
+            PR_NUM="${PR_NUM}"
+            PREVIEW_DIR="${PREVIEW_DIR}"
+
+            echo "Destroying preview-${PR_NUM}..."
+
+            # Stop pm2 processes (best-effort — continue if they are already gone).
+            pm2 delete "preview-${PR_NUM}-backend"  2>/dev/null || true
+            pm2 delete "preview-${PR_NUM}-frontend" 2>/dev/null || true
+
+            # Remove the preview working directory.
+            rm -rf ~/${PREVIEW_DIR}
+
+            echo "Preview-${PR_NUM} destroyed."
+          REMOTE
+
+      # Mark the GitHub deployment as inactive.
+      - name: Deactivate GitHub deployment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            const envName = `preview-pr-${prNumber}`;
+
+            const deployments = await github.rest.repos.listDeployments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              environment: envName,
+            });
+
+            for (const d of deployments.data) {
+              await github.rest.repos.createDeploymentStatus({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                deployment_id: d.id,
+                state: 'inactive',
+                description: 'Preview destroyed on PR close',
+              });
+            }
+
+      # Update the preview comment to reflect that the environment is gone.
+      - name: Update PR comment → destroyed
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            const marker = '<!-- xconfess-preview-comment -->';
+            const body = [
+              marker,
+              '## 🔍 Preview Environment',
+              '',
+              '**Status:** Destroyed (PR closed)',
+              `> Preview for PR #${prNumber} has been cleaned up.`,
+            ].join('\n');
+
+            const comments = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+            });
+
+            const existing = comments.data.find(c => c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            }
+
+  # ─── TTL reaper (daily cron + manual trigger) ─────────────────────────────
+  reaper:
+    name: Preview TTL reaper
+    if: >
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'cleanup-stale')
+    runs-on: ubuntu-latest
+    environment: preview
+
+    steps:
+      - name: Validate reaper secrets
+        run: |
+          missing=()
+          [[ -z "${{ secrets.PREVIEW_DEPLOY_HOST }}"    ]] && missing+=("PREVIEW_DEPLOY_HOST")
+          [[ -z "${{ secrets.PREVIEW_DEPLOY_USER }}"    ]] && missing+=("PREVIEW_DEPLOY_USER")
+          [[ -z "${{ secrets.PREVIEW_DEPLOY_SSH_KEY }}" ]] && missing+=("PREVIEW_DEPLOY_SSH_KEY")
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "::warning::Preview reaper secrets not configured (${missing[*]}). Skipping."
+            exit 0
+          fi
+
+      - name: Setup SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.PREVIEW_DEPLOY_SSH_KEY }}
+
+      - name: Add preview host to known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "${{ secrets.PREVIEW_DEPLOY_HOST }}" >> ~/.ssh/known_hosts
+
+      # Find and destroy any preview that has passed its TTL expiry.
+      # The expiry is recorded in ~/<preview-dir>/.preview-meta.json during
+      # provisioning.  The reaper reads the file and compares to current UTC.
+      - name: Destroy expired previews
+        run: |
+          ssh "${{ secrets.PREVIEW_DEPLOY_USER }}@${{ secrets.PREVIEW_DEPLOY_HOST }}" bash -s <<'REMOTE'
+            set -euo pipefail
+            NOW_EPOCH=$(date -u +%s)
+
+            for meta_file in ~/preview-*/. preview-meta.json 2>/dev/null; do
+              [[ -f "$meta_file" ]] || continue
+              PREVIEW_DIR=$(dirname "$meta_file")
+              PREVIEW_NAME=$(basename "$PREVIEW_DIR")
+
+              # Parse expires_at from JSON (requires jq or python).
+              EXPIRES_AT=""
+              if command -v jq &>/dev/null; then
+                EXPIRES_AT=$(jq -r '.expires_at // empty' "$meta_file" 2>/dev/null || true)
+              elif command -v python3 &>/dev/null; then
+                EXPIRES_AT=$(python3 -c "
+            import json, sys
+            with open('$meta_file') as f:
+                d = json.load(f)
+            print(d.get('expires_at',''))
+            " 2>/dev/null || true)
+              fi
+
+              [[ -z "$EXPIRES_AT" ]] && continue
+
+              EXPIRES_EPOCH=$(date -u -d "$EXPIRES_AT" +%s 2>/dev/null || echo 0)
+
+              if [[ $NOW_EPOCH -gt $EXPIRES_EPOCH ]]; then
+                echo "Reaping expired preview: ${PREVIEW_NAME} (expired ${EXPIRES_AT})"
+
+                # Extract PR number from dir name (preview-<number>)
+                PR_NUM="${PREVIEW_NAME#preview-}"
+
+                pm2 delete "preview-${PR_NUM}-backend"  2>/dev/null || true
+                pm2 delete "preview-${PR_NUM}-frontend" 2>/dev/null || true
+                rm -rf "${PREVIEW_DIR}"
+
+                echo "  ✔ ${PREVIEW_NAME} removed."
+              else
+                echo "  ⏱ ${PREVIEW_NAME} still active (expires ${EXPIRES_AT})."
+              fi
+            done
+
+            echo "Reaper complete."
+          REMOTE

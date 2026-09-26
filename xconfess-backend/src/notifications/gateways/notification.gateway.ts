@@ -15,6 +15,10 @@ import { JwtService } from '@nestjs/jwt';
 import { WsJwtGuard } from '../../auth/guards/ws-jwt.guard';
 import { NotificationService } from '../services/notification.service';
 import { WebSocketLogger } from '../../websocket/websocket.logger';
+import {
+  assertPayloadSize,
+  enforceSocketCap,
+} from '../../websocket/ws-memory-guard';
 
 /** Channel prefix for per-user private rooms */
 const USER_ROOM_PREFIX = 'user:';
@@ -118,6 +122,10 @@ export class NotificationGateway
     if (sockets) {
       sockets.add(client.id);
     }
+
+    // Enforce per-user connection cap to prevent unbounded heap growth
+    // from abandoned browser tabs (issue #102).
+    enforceSocketCap(userId, client.id, this.userSockets, this.server as any);
 
     this.logger.log(`Client connected: ${client.id} (User: ${userId})`);
 
@@ -258,6 +266,9 @@ export class NotificationGateway
   async handleMarkRead(client: Socket, payload: { notificationId: string }) {
     const userId = client.data.userId;
 
+    // Guard oversized payloads before any application logic runs (issue #102).
+    if (!assertPayloadSize(client, 'mark-read', payload)) return;
+
     try {
       await this.notificationService.markAsRead(payload.notificationId, userId);
 
@@ -337,4 +348,94 @@ export class NotificationGateway
     const sockets = this.userSockets.get(userId);
     return sockets !== undefined && sockets.size > 0;
   }
+
+  // ─── Reauthentication & Revocation Protocol ───────────────────────────────
+
+  @SubscribeMessage('auth:refresh')
+  async handleAuthRefresh(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() payload: { token?: string },
+  ) {
+    const oldUserId = client.data?.userId;
+    const token = payload?.token;
+
+    if (!token || typeof token !== 'string') {
+      this.logger.warn(`Auth refresh rejected on socket ${client.id}: missing token`);
+      client.emit('auth:rejected', {
+        reason: 'NO_TOKEN_PROVIDED',
+        timestamp: new Date().toISOString(),
+      });
+      return;
+    }
+
+    try {
+      const decoded: any = await this.jwtService.verifyAsync(token);
+      if (!decoded?.sub) {
+        throw new Error('MISSING_SUBJECT');
+      }
+
+      const newUserId = String(decoded.sub);
+
+      // If user identity changed during refresh, migrate socket tracking
+      if (oldUserId && oldUserId !== newUserId) {
+        const oldSet = this.userSockets.get(oldUserId);
+        if (oldSet) {
+          oldSet.delete(client.id);
+          if (oldSet.size === 0) this.userSockets.delete(oldUserId);
+        }
+        await client.leave(`${USER_ROOM_PREFIX}${oldUserId}`);
+      }
+
+      client.data = client.data || {};
+      client.data.userId = newUserId;
+      client.data.username = decoded.username;
+
+      // Re-register in user room
+      const newRoom = `${USER_ROOM_PREFIX}${newUserId}`;
+      await client.join(newRoom);
+
+      if (!this.userSockets.has(newUserId)) {
+        this.userSockets.set(newUserId, new Set());
+      }
+      this.userSockets.get(newUserId)?.add(client.id);
+
+      this.logger.log(`Socket ${client.id} successfully refreshed session for user ${newUserId}`);
+      client.emit('auth:refreshed', {
+        success: true,
+        userId: newUserId,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.logger.warn(`Auth refresh failed on socket ${client.id}: ${message}`);
+      client.emit('auth:revoked', {
+        reason: 'SESSION_REVOKED_OR_EXPIRED',
+        timestamp: new Date().toISOString(),
+      });
+      client.disconnect(true);
+    }
+  }
+
+  async revokeUserSessions(userId: string, reason = 'SESSION_REVOKED'): Promise<number> {
+    const socketIds = this.userSockets.get(userId);
+    if (!socketIds || socketIds.size === 0) return 0;
+
+    let disconnectedCount = 0;
+    for (const socketId of Array.from(socketIds)) {
+      const socket = this.server?.sockets?.sockets?.get?.(socketId);
+      if (socket) {
+        socket.emit('auth:revoked', {
+          reason,
+          timestamp: new Date().toISOString(),
+        });
+        socket.disconnect(true);
+        disconnectedCount++;
+      }
+    }
+
+    this.userSockets.delete(userId);
+    this.logger.warn(`Revoked ${disconnectedCount} active websocket sessions for user ${userId} (${reason})`);
+    return disconnectedCount;
+  }
 }
+

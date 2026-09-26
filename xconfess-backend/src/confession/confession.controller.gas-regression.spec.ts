@@ -90,7 +90,7 @@ describe('ConfessionController Gas Regression Tests', () => {
 
       // Gas check: Validation should be minimal overhead
       // In real environment, measure actual validation gas cost
-      expect(service.create).toHaveBeenCalledWith(invalidDto);
+      expect(service.create).toHaveBeenCalledWith(invalidDto, undefined, undefined);
     });
 
     it('should sanitize inputs efficiently', async () => {
@@ -343,7 +343,7 @@ describe('ConfessionController Gas Regression Tests', () => {
 
       // Assert
       expect(result).toBeDefined();
-      expect(service.create).toHaveBeenCalledWith(createDto);
+      expect(service.create).toHaveBeenCalledWith(createDto, undefined, undefined);
 
       // Cache invalidation should be targeted
       // Should not clear entire cache unnecessarily

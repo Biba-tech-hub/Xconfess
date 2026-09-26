@@ -117,12 +117,30 @@ export class AnalyticsService {
     // ambiguously shifted between buckets regardless of server timezone.
     const { startAt, endAt } = toWindowBoundaries(days);
 
+    // ── Privacy-aware trending (#85) ──────────────────────────────────────────
+    // Ranking is based on aggregated reaction counts within the window, not
+    // per-user activity, so individual behaviour cannot be inferred from output.
+    //
+    // Exclusions applied before ranking:
+    //   1. Soft-deleted confessions (isDeleted = true) are always excluded.
+    //   2. Private confessions (isPrivate = true) are excluded — they must not
+    //      appear in any public aggregation surface.
+    //
+    // Brigading suppression: confessions whose reaction count for the window
+    // falls below MIN_COHORT_SIZE are not surfaced (k-anonymity principle).
+    // This prevents a single-user post from trending via coordinated reactions.
+    //
+    // Content preview: only the first 200 characters are exposed (no full body).
     const trending = await this.confessionRepository
       .createQueryBuilder('confession')
       .leftJoinAndSelect('confession.reactions', 'reaction')
       .where('confession.created_at >= :startAt', { startAt })
       .andWhere('confession.created_at < :endAt', { endAt })
       .andWhere('confession.isDeleted = false')
+      // Exclude private confessions from trending surfaces.
+      .andWhere(
+        "(confession.is_private IS NULL OR confession.is_private = false)",
+      )
       .loadRelationCountAndMap(
         'confession.reactionCount',
         'confession.reactions',
@@ -131,18 +149,21 @@ export class AnalyticsService {
       .take(20)
       .getMany();
 
-    const result = trending.map((confession) => {
-      const confessionWithCounts =
-        confession as TrendingConfessionWithReactionCount;
-
-      return {
-        id: confession.id,
-        content: confession.content.substring(0, 200), // Preview only
-        reactionCount: confessionWithCounts.reactionCount || 0,
-        createdAt: confession.created_at,
-        category: confession.comments,
-      };
-    });
+    const result = trending
+      .map((confession) => {
+        const confessionWithCounts =
+          confession as TrendingConfessionWithReactionCount;
+        return {
+          id: confession.id,
+          content: confession.content.substring(0, 200), // Preview only — never full body
+          reactionCount: confessionWithCounts.reactionCount || 0,
+          createdAt: confession.created_at,
+          category: confession.comments,
+        };
+      })
+      // Brigading / small-cohort suppression: only surface confessions that
+      // reached at least MIN_COHORT_SIZE reactions in the window.
+      .filter((item) => item.reactionCount >= ANALYTICS_PRIVACY.MIN_COHORT_SIZE);
 
     // Cache the result
     await this.cacheService.set(cacheKey, result, this.CACHE_TTL);

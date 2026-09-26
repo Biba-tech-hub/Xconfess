@@ -31,6 +31,7 @@ describe('ExportProcessor', () => {
       convertToCsv: jest.fn(() => 'test,csv'),
       markExportFailed: jest.fn(),
       markExportProcessing: jest.fn(),
+      isExportCancelled: jest.fn(async () => false), // Issue #106: cancellation check
     };
 
     const module: TestingModule = await Test.createTestingModule({

@@ -1,11 +1,13 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import * as crypto from 'crypto';
 import { SavedSearch } from './entities/saved-search.entity';
 import { SearchHistory } from './entities/search-history.entity';
+import { UserDiscoveryPreference } from './entities/user-discovery-preference.entity';
 import { CreateSavedSearchDto } from './dto/create-saved-search.dto';
 import { SearchConfessionDto } from '../confession/dto/search-confession.dto';
+import { SearchAbuseGuard } from './search-abuse.guard';
 
 interface ExtendedSearchDto extends SearchConfessionDto {
   dateFrom?: string;
@@ -20,7 +22,9 @@ export class SearchDiscoveryService {
     private savedSearchRepo: Repository<SavedSearch>,
     @InjectRepository(SearchHistory)
     private searchHistoryRepo: Repository<SearchHistory>,
+    private readonly searchAbuseGuard: SearchAbuseGuard,
   ) {}
+
 
   private normalizeFilters(dto: ExtendedSearchDto): any {
     const { q, page, limit, ...filters } = dto;
@@ -41,12 +45,34 @@ export class SearchDiscoveryService {
   // EXECUTE FULL TEXT SEARCH WITH FILTERS & HISTORY LOGGING
   // =========================================================
   async executeFullTextSearch(userId: number, dto: ExtendedSearchDto) {
-    // Automatically log the entry to history if a text keyword query is passed
-    if (dto.q && dto.q.trim()) {
-      await this.recordSearch(userId, dto);
+    const q = dto.q?.trim() || '';
+
+    // ── Abuse / cost-budget check (#84) ───────────────────────────────────────
+    // Assess before any DB work. Violations are logged without raw query text.
+    if (q) {
+      const assessment = this.searchAbuseGuard.assess(
+        q,
+        dto.page ?? 1,
+        dto.limit ?? 40,
+      );
+      if (!assessment.allowed) {
+        throw new BadRequestException({
+          statusCode: 400,
+          error: 'Search query rejected',
+          // Surface the first human-readable message; others are in violations[].
+          message: assessment.violations[0]?.message ?? 'Query exceeds allowed complexity.',
+          violations: assessment.violations.map((v) => ({
+            code: v.code,
+            message: v.message,
+          })),
+        });
+      }
     }
 
-    const q = dto.q?.trim() || '';
+    // Automatically log the entry to history if a text keyword query is passed
+    if (q) {
+      await this.recordSearch(userId, dto);
+    }
     const manager = this.searchHistoryRepo.manager;
     const conditions: string[] = ['is_deleted = false'];
     const parameters: any[] = [];
@@ -201,4 +227,199 @@ export class SearchDiscoveryService {
       take: 20,
     });
   }
+
+  // =========================================================
+  // RECOMMENDATION SAFEGUARDS, DIVERSITY & EXPLAINABILITY
+  // =========================================================
+  async getUserDiscoveryPreference(userId: number): Promise<UserDiscoveryPreference> {
+    let pref = await this.discoveryPreferenceRepo.findOne({ where: { userId } });
+    if (!pref) {
+      pref = this.discoveryPreferenceRepo.create({
+        userId,
+        personalizationOptOut: false,
+        diversityThreshold: 0.35,
+        excludedCategories: [],
+      });
+      await this.discoveryPreferenceRepo.save(pref);
+    }
+    return pref;
+  }
+
+  async updateUserDiscoveryPreference(
+    userId: number,
+    dto: UpdateDiscoveryPreferencesDto,
+  ): Promise<UserDiscoveryPreference> {
+    const pref = await this.getUserDiscoveryPreference(userId);
+    if (dto.personalizationOptOut !== undefined) {
+      pref.personalizationOptOut = dto.personalizationOptOut;
+    }
+    if (dto.diversityThreshold !== undefined) {
+      pref.diversityThreshold = Math.min(Math.max(dto.diversityThreshold, 0.1), 0.9);
+    }
+    if (dto.excludedCategories !== undefined) {
+      pref.excludedCategories = dto.excludedCategories;
+    }
+    return this.discoveryPreferenceRepo.save(pref);
+  }
+
+  async getPersonalizedRecommendations(
+    userId: number,
+    limit = 20,
+  ): Promise<RecommendedConfessionDto[]> {
+    const preferences = await this.getUserDiscoveryPreference(userId);
+    const manager = this.searchHistoryRepo.manager;
+    const safeLimit = Math.min(Math.max(limit, 1), 50);
+
+    // If user has opted out of personalization, serve diverse trending content only
+    if (preferences.personalizationOptOut) {
+      const publicRows: any[] = await manager.query(
+        `SELECT id, title, category, reaction_count as "reactionCount", gender, created_at as "createdAt"
+         FROM anonymous_confessions
+         WHERE is_deleted = false
+         ORDER BY reaction_count DESC, created_at DESC
+         LIMIT $1`,
+        [safeLimit * 2],
+      );
+
+      return this.applyDiversityAndExplanations(
+        publicRows,
+        safeLimit,
+        preferences.diversityThreshold,
+        preferences.excludedCategories || [],
+        false,
+        'Trending public discovery (personalization disabled)',
+      );
+    }
+
+    // Personalization enabled: inspect recent history for topic interests
+    const recentHistory = await this.getRecentSearches(userId);
+    const interestedKeywords = recentHistory.map((h) => h.query.toLowerCase()).slice(0, 5);
+
+    // Fetch candidate pool
+    const candidates: any[] = await manager.query(
+      `SELECT id, title, category, reaction_count as "reactionCount", gender, created_at as "createdAt"
+       FROM anonymous_confessions
+       WHERE is_deleted = false
+       ORDER BY created_at DESC, reaction_count DESC
+       LIMIT $1`,
+      [safeLimit * 3],
+    );
+
+    // Score and explain candidates
+    return this.applyPersonalizedRanking(
+      candidates,
+      interestedKeywords,
+      safeLimit,
+      preferences.diversityThreshold,
+      preferences.excludedCategories || [],
+    );
+  }
+
+  private applyPersonalizedRanking(
+    candidates: any[],
+    keywords: string[],
+    limit: number,
+    diversityThreshold: number,
+    excludedCategories: string[],
+  ): RecommendedConfessionDto[] {
+    const categoryCounts: Record<string, number> = {};
+    const maxPerCategory = Math.max(1, Math.floor(limit * (1 - diversityThreshold)));
+    const results: RecommendedConfessionDto[] = [];
+
+    // Filter excluded categories
+    const allowed = candidates.filter(
+      (c) => !excludedCategories.includes(c.category),
+    );
+
+    for (const item of allowed) {
+      if (results.length >= limit) break;
+
+      const cat = item.category || 'general';
+      const currentCatCount = categoryCounts[cat] || 0;
+
+      // Filter bubble guard: enforce diversity constraint
+      if (currentCatCount >= maxPerCategory && results.length < limit - 2) {
+        continue;
+      }
+
+      const titleLower = (item.title || '').toLowerCase();
+      const matchedKeyword = keywords.find((kw) => titleLower.includes(kw));
+
+      let source: 'recent_interest' | 'global_trending' | 'diversity_fill' = 'global_trending';
+      let reason = 'Popular across the community';
+
+      if (matchedKeyword) {
+        source = 'recent_interest';
+        reason = `Suggested because you recently explored "${matchedKeyword}"`;
+      } else if (currentCatCount === 0) {
+        source = 'diversity_fill';
+        reason = `Broadening your discovery with ${cat}`;
+      }
+
+      categoryCounts[cat] = currentCatCount + 1;
+      results.push({
+        id: item.id,
+        title: item.title,
+        category: cat,
+        reactionCount: Number(item.reactionCount) || 0,
+        gender: item.gender,
+        createdAt: item.createdAt,
+        explanation: {
+          source,
+          reason,
+          category: cat,
+        },
+        isPersonalized: true,
+      });
+    }
+
+    return results;
+  }
+
+  private applyDiversityAndExplanations(
+    candidates: any[],
+    limit: number,
+    diversityThreshold: number,
+    excludedCategories: string[],
+    isPersonalized: boolean,
+    defaultReason: string,
+  ): RecommendedConfessionDto[] {
+    const categoryCounts: Record<string, number> = {};
+    const maxPerCategory = Math.max(1, Math.floor(limit * (1 - diversityThreshold)));
+    const results: RecommendedConfessionDto[] = [];
+
+    const allowed = candidates.filter(
+      (c) => !excludedCategories.includes(c.category),
+    );
+
+    for (const item of allowed) {
+      if (results.length >= limit) break;
+
+      const cat = item.category || 'general';
+      const currentCatCount = categoryCounts[cat] || 0;
+
+      if (currentCatCount >= maxPerCategory && results.length < limit - 2) {
+        continue;
+      }
+
+      categoryCounts[cat] = currentCatCount + 1;
+      results.push({
+        id: item.id,
+        title: item.title,
+        category: cat,
+        reactionCount: Number(item.reactionCount) || 0,
+        gender: item.gender,
+        createdAt: item.createdAt,
+        explanation: {
+          source: 'global_trending',
+          reason: defaultReason,
+          category: cat,
+        },
+        isPersonalized,
+      });
+    }
+
+    return results;
+  }
 }
+

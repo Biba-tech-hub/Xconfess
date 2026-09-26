@@ -1,0 +1,119 @@
+name: Contract / on-chain work
+description: Track Soroban contract changes, ABI updates, deployment tasks, or on-chain integration work.
+title: "[Contract] "
+labels: ["contracts"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template for Soroban contract changes, ABI updates, gas baseline changes, deployment tasks, and backend integration with on-chain state.
+        Before opening, review:
+        - [xconfess-contracts/README.md](https://github.com/Xconfess/Xconfess/blob/main/xconfess-contracts/README.md)
+        - [docs/contract-abi-reference.md](https://github.com/Xconfess/Xconfess/blob/main/docs/contract-abi-reference.md)
+        - [docs/contract-release-and-upgrade-runbook.md](https://github.com/Xconfess/Xconfess/blob/main/docs/contract-release-and-upgrade-runbook.md)
+
+  - type: dropdown
+    id: change_type
+    attributes:
+      label: Change type
+      options:
+        - New contract function
+        - Existing function change (ABI breaking)
+        - Existing function change (ABI compatible)
+        - Storage layout change
+        - Gas optimisation
+        - Error code addition
+        - Deployment / upgrade
+        - Backend integration (off-chain side)
+        - Documentation / runbook
+    validations:
+      required: true
+
+  - type: dropdown
+    id: abi_breaking
+    attributes:
+      label: ABI breaking change?
+      options:
+        - "No"
+        - "Yes — requires backend client update"
+        - "Unsure"
+    validations:
+      required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Describe the contract change or integration task.
+    validations:
+      required: true
+
+  - type: textarea
+    id: affected_contracts
+    attributes:
+      label: Affected contracts
+      description: Which contracts in xconfess-contracts/contracts/ are in scope?
+      placeholder: |
+        - confession-anchor
+        - anonymous-tipping
+        - reputation-badges
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: What is in scope and out of scope?
+      placeholder: |
+        In scope:
+        -
+
+        Out of scope:
+        -
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Testable checks a reviewer can run locally.
+      placeholder: |
+        - [ ] Contract tests pass (cargo test --workspace)
+        - [ ] ABI drift check passes (bash xconfess-contracts/scripts/check-abi-drift.sh)
+        - [ ] Gas baseline updated if instrumented function changed (gas-baseline.json)
+        - [ ] Backend client updated if ABI changed
+        - [ ] abi.json committed alongside source changes
+        - [ ] Deployment runbook followed for testnet deploy (if applicable)
+    validations:
+      required: true
+
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation
+      description: Exact commands to prove the work.
+      placeholder: |
+        npm run preflight && npm run ci
+        # From xconfess-contracts/:
+        cargo test --workspace
+        bash scripts/check-abi-drift.sh
+    validations:
+      required: true
+
+  - type: textarea
+    id: migration
+    attributes:
+      label: Migration / upgrade strategy
+      description: For breaking ABI changes or storage layout changes, describe the upgrade path.
+      placeholder: |
+        - Contract is not upgradeable — requires new deployment
+        - Backend compatibility shim required until old contract is retired
+        - See docs/contract-storage-migrations.md
+
+  - type: textarea
+    id: assumptions
+    attributes:
+      label: Assumptions and follow-up
+      description: Call out any assumptions (testnet only, mainnet not yet supported, etc.) and follow-up work.

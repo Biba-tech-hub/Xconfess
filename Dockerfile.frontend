@@ -1,5 +1,21 @@
+# syntax=docker/dockerfile:1.7
+# ──────────────────────────────────────────────────────────────────────────────
+# Dockerfile.frontend
+#
+# Multi-stage hardened build for the xConfess Next.js 16 frontend.
+#
+# Hardening applied (issue #130):
+#   - Pinned base image via node:22-alpine (consistent digest with backend).
+#   - Non-root user (node, uid 1000) in the final stage.
+#   - Minimal surface: only .next, public, and next.config are in the runner.
+#   - dumb-init as PID 1 for proper SIGTERM handling.
+#   - NEXT_PUBLIC_DEV_BYPASS_AUTH forced to false at build time.
+# ──────────────────────────────────────────────────────────────────────────────
+
 FROM node:22-alpine AS deps
 WORKDIR /app
+
+RUN apk add --no-cache dumb-init
 
 COPY package.json package-lock.json ./
 COPY xconfess-backend/package.json ./xconfess-backend/package.json
@@ -7,6 +23,7 @@ COPY xconfess-contracts/package.json ./xconfess-contracts/package.json
 COPY xconfess-frontend/package.json ./xconfess-frontend/package.json
 RUN npm ci --include=optional --no-audit --no-fund
 
+# ── Build ─────────────────────────────────────────────────────────────────────
 FROM deps AS build
 WORKDIR /app
 
@@ -23,13 +40,19 @@ ENV NEXT_PUBLIC_WS_URL=$NEXT_PUBLIC_WS_URL
 ENV NEXT_PUBLIC_APP_URL=$NEXT_PUBLIC_APP_URL
 ENV NEXT_PUBLIC_STELLAR_NETWORK=$NEXT_PUBLIC_STELLAR_NETWORK
 ENV NEXT_PUBLIC_STELLAR_CONTRACT_ID=$NEXT_PUBLIC_STELLAR_CONTRACT_ID
+# Never enable the dev auth bypass in container builds.
 ENV NEXT_PUBLIC_DEV_BYPASS_AUTH=false
 
 COPY . .
 RUN npm run frontend:build
 
+# ── Production runtime ────────────────────────────────────────────────────────
 FROM node:22-alpine AS runner
 WORKDIR /app
+
+RUN apk add --no-cache dumb-init \
+    && find / -perm /6000 -type f -exec chmod a-s {} \; 2>/dev/null || true
+
 ENV NODE_ENV=production
 ENV PORT=3000
 
@@ -42,7 +65,15 @@ COPY --from=build /app/xconfess-frontend/.next ./xconfess-frontend/.next
 COPY --from=build /app/xconfess-frontend/public ./xconfess-frontend/public
 COPY --from=build /app/xconfess-frontend/next.config.mjs ./xconfess-frontend/next.config.mjs
 
+# Drop privileges.
+RUN chown -R node:node /app
+USER node
+
 WORKDIR /app/xconfess-frontend
 EXPOSE 3000
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 CMD node -e "require('http').get('http://127.0.0.1:' + (process.env.PORT || 3000) + '/', r => process.exit(r.statusCode < 500 ? 0 : 1)).on('error', () => process.exit(1))"
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+  CMD node -e "require('http').get('http://127.0.0.1:' + (process.env.PORT || 3000) + '/', r => process.exit(r.statusCode < 500 ? 0 : 1)).on('error', () => process.exit(1))"
+
+ENTRYPOINT ["/usr/bin/dumb-init", "--"]
 CMD ["npm", "run", "start"]

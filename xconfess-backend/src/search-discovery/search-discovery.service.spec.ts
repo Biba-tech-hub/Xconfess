@@ -5,6 +5,7 @@ import { Repository } from 'typeorm';
 import { SearchDiscoveryService } from './search-discovery.service';
 import { SavedSearch } from './entities/saved-search.entity';
 import { SearchHistory } from './entities/search-history.entity';
+import { SearchAbuseGuard } from './search-abuse.guard';
 
 describe('SearchDiscoveryService', () => {
   let service: SearchDiscoveryService;
@@ -32,6 +33,7 @@ describe('SearchDiscoveryService', () => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         SearchDiscoveryService,
+        SearchAbuseGuard,
         {
           provide: getRepositoryToken(SavedSearch),
           useValue: savedSearchRepo,
@@ -236,6 +238,46 @@ describe('SearchDiscoveryService', () => {
     });
   });
 
+  // ── Issue #84 — Abuse guard integration ───────────────────────────────────
+
+  describe('executeFullTextSearch abuse guard', () => {
+    it('throws BadRequestException for wildcard queries', async () => {
+      const mockManager = { query: jest.fn().mockResolvedValue([]) };
+      searchHistoryRepo.manager = mockManager as any;
+
+      await expect(
+        service.executeFullTextSearch(1, { q: 'work*' } as any),
+      ).rejects.toThrow('Wildcard and regex-like characters');
+
+      // DB must not be queried for abusive inputs
+      expect(mockManager.query).not.toHaveBeenCalled();
+    });
+
+    it('throws BadRequestException for repetition-spam queries', async () => {
+      const mockManager = { query: jest.fn().mockResolvedValue([]) };
+      searchHistoryRepo.manager = mockManager as any;
+
+      await expect(
+        service.executeFullTextSearch(1, { q: 'love love love love love' } as any),
+      ).rejects.toThrow('repeat the same words');
+
+      expect(mockManager.query).not.toHaveBeenCalled();
+    });
+
+    it('allows a normal query through to the DB', async () => {
+      const mockManager = { query: jest.fn().mockResolvedValue([]) };
+      searchHistoryRepo.manager = mockManager as any;
+      searchHistoryRepo.findOne.mockResolvedValue(null);
+      searchHistoryRepo.create.mockImplementation((x) => x as any);
+      searchHistoryRepo.save.mockResolvedValue({} as any);
+      searchHistoryRepo.count.mockResolvedValue(1);
+
+      const result = await service.executeFullTextSearch(1, { q: 'work stress' } as any);
+      expect(mockManager.query).toHaveBeenCalled();
+      expect(result).toBeDefined();
+    });
+  });
+
   // ── Issue #1811 — Search query bounds ─────────────────────────────────────
 
   describe('search query bounds', () => {
@@ -256,21 +298,17 @@ describe('SearchDiscoveryService', () => {
       expect(mockManager.query).toHaveBeenCalledTimes(2);
     });
 
-    it('very long query does not break the query builder', async () => {
-      const mockManager = makeManager();
+    it('very long query (>120 chars) is rejected by the abuse guard', async () => {
+      const mockManager = { query: jest.fn().mockResolvedValue([]) };
       searchHistoryRepo.manager = mockManager as any;
-      searchHistoryRepo.findOne.mockResolvedValue(null);
-      searchHistoryRepo.create.mockImplementation((x) => x as any);
-      searchHistoryRepo.save.mockResolvedValue({} as any);
-      searchHistoryRepo.count.mockResolvedValue(1);
 
-      const longQuery = 'a'.repeat(5000);
-      await service.executeFullTextSearch(1, { q: longQuery } as any);
+      const longQuery = 'a'.repeat(200);
+      await expect(
+        service.executeFullTextSearch(1, { q: longQuery } as any),
+      ).rejects.toThrow('must not exceed');
 
-      const [query, params] = mockManager.query.mock.calls[0];
-      // Parameterized — no injection risk regardless of length
-      expect(query).toContain('$1');
-      expect(params).toContain(longQuery);
+      // Guard should prevent DB queries for over-length inputs
+      expect(mockManager.query).not.toHaveBeenCalled();
     });
 
     it('special characters in query do not break SQL', async () => {

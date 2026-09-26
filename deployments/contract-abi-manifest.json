@@ -1,38 +1,78 @@
 {
-  "manifest_version": "1.0",
+  "manifest_version": "2.0",
   "generated_at_utc": "2026-07-23T00:00:00Z",
-  "description": "Expected ABI/event compatibility manifest for Xconfess contracts. Update this alongside MAJOR version bumps.",
+  "description": "Expected ABI/event compatibility manifest for Xconfess contracts. Update this alongside MAJOR version bumps. Each contract entry carries cryptographic checksums for its WASM and ABI artifacts, network/environment metadata, and signer provenance so consumers can reject tampered or incompatible deployments.",
+  "network": {
+    "network_id": "testnet",
+    "network_passphrase": "Test SDF Network ; September 2015",
+    "environment": "staging"
+  },
+  "signer": {
+    "identity": "xconfess-deployer",
+    "public_key": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+    "algorithm": "ed25519",
+    "signature": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "checksum_algorithm": "sha256",
   "contracts": {
     "confession-anchor": {
       "version": "0.1.0",
       "event_schema_version": 1,
       "error_registry_version": 1,
+      "contract_id": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+      "wasm_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "abi_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "functions": [
         "anchor_confession",
         "verify_confession",
         "get_confession_count",
         "get_version",
         "get_event_schema_version",
-        "get_error_registry_version"
+        "get_error_registry_version",
+        "get_upgrade_policy"
       ]
     },
     "confession-registry": {
       "version": "0.1.0",
       "event_schema_version": 1,
       "error_registry_version": 1,
-      "functions": []
+      "functions": [
+        "init",
+        "create_confession",
+        "get_confession",
+        "get_author_confessions",
+        "get_total_count",
+        "migrate",
+        "schema_version"
+      ]
     },
     "anonymous-tipping": {
       "version": "1.0.0",
       "event_schema_version": 1,
       "error_registry_version": 1,
-      "functions": []
+      "functions": [
+        "init",
+        "send_tip",
+        "get_tips",
+        "latest_settlement_nonce",
+        "configure_controls",
+        "pause",
+        "unpause",
+        "is_paused",
+        "get_rate_limit_config"
+      ]
     },
     "reputation-badges": {
       "version": "0.0.0",
       "event_schema_version": 1,
       "error_registry_version": 1,
-      "functions": []
+      "functions": [
+        "init",
+        "mint_badge",
+        "get_badge",
+        "adjust_reputation",
+        "get_user_reputation"
+      ]
     }
   }
 }

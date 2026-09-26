@@ -1,4 +1,4 @@
-﻿import { Logger, MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
+import { Logger, MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
 import { SanitizationMiddleware } from './middleware/sanitization.middleware';
 import { RequestIdMiddleware } from './middleware/request-id.middleware'; // ADAPT: fix path if it lives elsewhere
 import { AppController } from './app.controller';
@@ -24,6 +24,7 @@ import { MessagesModule } from './messages/messages.module';
 import { AdminModule } from './admin/admin.module';
 import { EventEmitterModule } from '@nestjs/event-emitter';
 import { ReportModule } from './report/report.module';
+import { AppealModule } from './appeal/appeal.module';
 import { DataExportModule } from './data-export/data-export.module';
 import { StellarModule } from './stellar/stellar.module';
 import { CacheModule } from './cache/cache.module';
@@ -41,6 +42,8 @@ import { AnalyticsModule } from './analytics/analytics.module';
 // The legacy @nestjs/bull import has been removed. All queues use BullMQ.
 import { BullModule } from '@nestjs/bullmq';
 import { StructuredLoggingInterceptor } from './common/logging/structured-logging.interceptor';
+import { PerformanceInterceptor } from './common/interceptors/performance.interceptor';
+import { HttpCacheInterceptor } from './common/interceptors/http-cache.interceptor';
 
 @Module({
   imports: [
@@ -139,6 +142,7 @@ import { StructuredLoggingInterceptor } from './common/logging/structured-loggin
     MessagesModule,
     AdminModule,
     ReportModule,
+    AppealModule,
     DataExportModule,
     NotificationsModule,
     StellarModule,
@@ -161,6 +165,16 @@ import { StructuredLoggingInterceptor } from './common/logging/structured-loggin
     {
       provide: APP_INTERCEPTOR,
       useClass: StructuredLoggingInterceptor,
+    },
+    // Issue #101: latency budget enforcement and p50/p95/p99 tracking.
+    {
+      provide: APP_INTERCEPTOR,
+      useClass: PerformanceInterceptor,
+    },
+    // Issue #103: HTTP cache headers, ETags, and 304 conditional responses.
+    {
+      provide: APP_INTERCEPTOR,
+      useClass: HttpCacheInterceptor,
     },
   ],
 })

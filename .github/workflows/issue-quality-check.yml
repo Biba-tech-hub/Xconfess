@@ -1,0 +1,189 @@
+name: Issue Quality Check
+
+# Checks newly-opened or edited issues for required structure.
+# Non-compliant issues receive an actionable comment; they are never closed
+# or modified automatically.
+#
+# Required sections (case-insensitive):
+#   Summary, Scope, Acceptance criteria, Validation
+#
+# The workflow also warns when:
+#   - No labels have been applied
+#   - A possible duplicate keyword appears in the title
+#   - The issue has fewer than 50 characters of body text
+
+on:
+  issues:
+    types: [opened, edited, reopened]
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  quality-check:
+    name: Issue quality check
+    runs-on: ubuntu-latest
+    # Skip bots (Dependabot, Renovate, etc.)
+    if: ${{ !contains(github.event.issue.user.login, '[bot]') && !contains(github.event.issue.user.login, 'dependabot') }}
+
+    steps:
+      - name: Check issue quality
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const body  = (issue.body || '').trim();
+            const title = (issue.title || '').trim();
+            const labels = (issue.labels || []).map(l => l.name);
+
+            // ── Required section headings ──────────────────────────────────
+            const requiredSections = [
+              { heading: 'summary',             label: 'Summary' },
+              { heading: 'scope',               label: 'Scope' },
+              { heading: 'acceptance criteria', label: 'Acceptance criteria' },
+              { heading: 'validation',          label: 'Validation' },
+            ];
+
+            const bodyLower = body.toLowerCase();
+            const missingSections = requiredSections.filter(
+              s => !bodyLower.includes(s.heading)
+            );
+
+            // ── Minimum body length ────────────────────────────────────────
+            const MIN_BODY_LENGTH = 50;
+            const bodyTooShort = body.length < MIN_BODY_LENGTH;
+
+            // ── Label check ────────────────────────────────────────────────
+            const noLabels = labels.length === 0;
+
+            // ── Duplicate keyword check ────────────────────────────────────
+            const dupKeywords = ['duplicate', 'dup:', 'same as #', 'same issue as'];
+            const titleLower = title.toLowerCase();
+            const likelyDuplicate = dupKeywords.some(k => titleLower.includes(k));
+
+            // ── Collect all issues ─────────────────────────────────────────
+            const problems = [];
+            const warnings = [];
+
+            if (bodyTooShort) {
+              problems.push(
+                `**Body is too short** (${body.length} chars). ` +
+                `Please provide at least ${MIN_BODY_LENGTH} characters of description.`
+              );
+            }
+
+            if (missingSections.length > 0) {
+              problems.push(
+                '**Missing required sections**: ' +
+                missingSections.map(s => `\`${s.label}\``).join(', ') + '.\n' +
+                '  Each section should appear as a Markdown heading (e.g. `## Summary`).'
+              );
+            }
+
+            if (noLabels) {
+              warnings.push(
+                '**No labels applied.** Please add at least one label ' +
+                '(e.g. `bug`, `enhancement`, `Stellar Wave`) to help with triage.'
+              );
+            }
+
+            if (likelyDuplicate) {
+              warnings.push(
+                '**Possible duplicate detected** based on the issue title. ' +
+                'If this is intentional, disregard this note.'
+              );
+            }
+
+            // ── Nothing to report ──────────────────────────────────────────
+            if (problems.length === 0 && warnings.length === 0) {
+              console.log('Issue passes quality checks.');
+              return;
+            }
+
+            // ── Build comment ──────────────────────────────────────────────
+            const lines = [
+              '<!-- xconfess-issue-quality-check -->',
+              '## ⚠️ Issue Quality Check',
+              '',
+              'Automated checks found the following items that need attention before this issue can be triaged efficiently.',
+              'This comment is informational — the issue is **not** closed or modified automatically.',
+              '',
+            ];
+
+            if (problems.length > 0) {
+              lines.push('### Must fix');
+              for (const p of problems) lines.push(`- ${p}`);
+              lines.push('');
+            }
+
+            if (warnings.length > 0) {
+              lines.push('### Nice to fix');
+              for (const w of warnings) lines.push(`- ${w}`);
+              lines.push('');
+            }
+
+            lines.push(
+              '### Expected structure',
+              '',
+              'Issues should follow this template:',
+              '',
+              '```',
+              '## Summary',
+              'One-paragraph description of the problem or feature.',
+              '',
+              '## Scope',
+              'What is in scope and what is explicitly out of scope.',
+              '',
+              '## Acceptance criteria',
+              'Bullet list of verifiable done conditions.',
+              '',
+              '## Validation',
+              'Commands or steps a reviewer can run to confirm the fix (e.g. `npm run ci`).',
+              '```',
+              '',
+              '---',
+              '_Posted by the [Issue Quality Check workflow](.github/workflows/issue-quality-check.yml). ' +
+              'Edit this issue to re-trigger the check._',
+            );
+
+            const commentBody = lines.join('\n');
+
+            // ── Upsert comment (avoid duplicates on re-edits) ─────────────
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: issue.number,
+              per_page: 50,
+            });
+
+            const existing = comments.find(c =>
+              c.body.includes('<!-- xconfess-issue-quality-check -->')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner:      context.repo.owner,
+                repo:       context.repo.repo,
+                comment_id: existing.id,
+                body:       commentBody,
+              });
+              console.log(`Updated existing quality-check comment #${existing.id}`);
+            } else {
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: issue.number,
+                body:         commentBody,
+              });
+              console.log('Posted new quality-check comment.');
+            }
+
+            // Fail the job only for must-fix problems so maintainers can see
+            // it in the Checks UI, but do not block issue creation.
+            if (problems.length > 0) {
+              core.warning(
+                `Issue #${issue.number} has ${problems.length} quality problem(s). ` +
+                'See the issue comment for details.'
+              );
+            }

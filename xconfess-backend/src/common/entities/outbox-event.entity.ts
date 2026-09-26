@@ -13,6 +13,7 @@ export enum OutboxStatus {
   COMPLETED = 'COMPLETED',
   SKIPPED = 'SKIPPED',
   FAILED = 'FAILED',
+  DEAD_LETTER = 'DEAD_LETTER',
 }
 
 @Entity('outbox_events')
@@ -23,6 +24,13 @@ export class OutboxEvent {
   @Column()
   @Index()
   type: string;
+
+  @Column({ type: 'varchar', length: 50, default: 'notification' })
+  @Index()
+  domain: string;
+
+  @Column({ type: 'int', default: 1 })
+  eventVersion: number;
 
   @Column({ type: 'jsonb' })
   payload: any;
@@ -63,3 +71,4 @@ export class OutboxEvent {
   @Index()
   claimedAt: Date;
 }
+

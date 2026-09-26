@@ -4,6 +4,7 @@ import { Repository } from 'typeorm';
 import { AuditLogService } from './audit-log.service';
 import { AuditLog, AuditActionType } from './audit-log.entity';
 import { AuditLogRedactionService } from './audit-log-redaction.service';
+import { AuditLogIntegrityService } from './audit-log-integrity.service';
 
 describe('AuditLogService', () => {
   let service: AuditLogService;
@@ -29,7 +30,17 @@ describe('AuditLogService', () => {
 
   const mockRepository = {
     create: jest.fn(),
-    save: jest.fn(),
+    save: jest.fn().mockResolvedValue({
+      id: 'mock-id-1234',
+      action: 'failed_login',
+      adminId: null,
+      entityType: null,
+      entityId: null,
+      requestId: null,
+      ipAddress: null,
+      createdAt: new Date('2026-01-01T00:00:00.000Z'),
+    }),
+    update: jest.fn().mockResolvedValue({ affected: 1 }),
     find: jest.fn(),
     createQueryBuilder: jest.fn(() => mockQueryBuilder),
   };
@@ -52,6 +63,13 @@ describe('AuditLogService', () => {
         {
           provide: AuditLogRedactionService,
           useValue: mockRedaction,
+        },
+        {
+          provide: AuditLogIntegrityService,
+          useValue: {
+            computeIntegrityHash: jest.fn().mockReturnValue('fakehash64'),
+            isConfigured: true,
+          },
         },
       ],
     }).compile();

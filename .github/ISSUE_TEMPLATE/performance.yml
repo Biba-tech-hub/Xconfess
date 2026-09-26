@@ -1,0 +1,101 @@
+name: Performance issue or optimisation
+description: Report a measured performance regression or propose a targeted optimisation with evidence.
+title: "[Performance] "
+labels: ["performance"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Performance issues must be backed by measurements, not assumptions.
+        Before opening, check [PERFORMANCE_BASELINE.md](https://github.com/Xconfess/Xconfess/blob/main/PERFORMANCE_BASELINE.md) and [PERFORMANCE_GUIDELINES.md](https://github.com/Xconfess/Xconfess/blob/main/PERFORMANCE_GUIDELINES.md).
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: Category
+      options:
+        - API response time (backend)
+        - Database query
+        - Frontend render / bundle size
+        - Queue throughput (BullMQ / Redis)
+        - Contract gas usage (Soroban)
+        - Cold start / boot time
+        - Memory usage
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One paragraph describing the observed performance problem or the optimisation target.
+    validations:
+      required: true
+
+  - type: textarea
+    id: baseline
+    attributes:
+      label: Baseline measurement
+      description: Provide concrete numbers — p50/p95 latency, query time, bundle size, gas units, etc. How was this measured?
+      placeholder: |
+        Measurement: GET /api/confessions p95 = 2400 ms (local, seed data, 20 confessions)
+        Tool: curl --trace-time / TYPEORM_LOGGING=true / Chrome DevTools
+        Commit / environment: main @ abc1234, Node 22, Postgres 16
+    validations:
+      required: true
+
+  - type: textarea
+    id: target
+    attributes:
+      label: Target / success threshold
+      description: What is the acceptable outcome? Use the same units as the baseline.
+      placeholder: |
+        p95 < 200 ms for /api/confessions with 1000 rows
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: Which queries, routes, components, or contracts are in scope?
+      placeholder: |
+        In scope:
+        -
+
+        Out of scope:
+        -
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: How will a reviewer verify the improvement?
+      placeholder: |
+        - [ ] Before/after benchmark included in PR description
+        - [ ] No regression on other measured endpoints
+        - [ ] EXPLAIN ANALYZE output (for DB changes) attached
+        - [ ] No new N+1 queries introduced
+        - [ ] Tests still pass (npm run ci)
+    validations:
+      required: true
+
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation
+      description: Exact commands to measure and prove the improvement.
+      placeholder: |
+        npm run preflight && npm run ci
+        # Attach EXPLAIN ANALYZE or profiler output to the PR
+    validations:
+      required: true
+
+  - type: textarea
+    id: assumptions
+    attributes:
+      label: Assumptions and follow-up
+      description: Call out any assumptions (e.g. only tested with seed data) and what follow-up work this reveals.

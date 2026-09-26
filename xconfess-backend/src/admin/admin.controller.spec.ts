@@ -8,6 +8,7 @@ import { StepUpGuard } from '../auth/guards/step-up.guard';
 import { ModerationTemplateService } from '../comment/moderation-template.service';
 import { AuditLogService } from '../audit-log/audit-log.service';
 import { StellarDiagnosticsService } from './services/stellar-diagnostics.service';
+import { DiagnosticsBundleService } from './services/diagnostics-bundle.service';
 
 describe('AdminController', () => {
   let controller: AdminController;
@@ -73,6 +74,10 @@ describe('AdminController', () => {
         {
           provide: StellarDiagnosticsService,
           useValue: mockStellarDiagnosticsService,
+        },
+        {
+          provide: DiagnosticsBundleService,
+          useValue: { build: jest.fn().mockResolvedValue({ bundleId: 'test-bundle' }) },
         },
       ],
     })

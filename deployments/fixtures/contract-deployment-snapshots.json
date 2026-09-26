@@ -1,0 +1,225 @@
+{
+  "snapshot_version": "1.0.0",
+  "generated_at_utc": "2026-09-25T08:00:00Z",
+  "network": "testnet",
+  "description": "Baseline deployment fixture snapshots for xConfess contracts verifying storage layouts, event schemas, authorization boundaries, and upgrade/rollback constraints.",
+  "contracts": {
+    "confession-anchor": {
+      "contract_id": "CB5XMDHT66EISB4WXM4YGNDHYRMZDX42TOHZEAENIUTSSMRFHJSFRNHB",
+      "version": "0.1.0",
+      "sha256": "fc4f4e6ccb4b38ad71ace722a69dc3470a675d3f112788abba94bb3b443ce7d7",
+      "schema_version": 1,
+      "storage_layout": [
+        {
+          "key": "Confession(BytesN<32>)",
+          "type": "u64",
+          "storage_type": "persistent",
+          "description": "Stores block timestamp when hash was anchored"
+        },
+        {
+          "key": "Count",
+          "type": "u64",
+          "storage_type": "instance",
+          "description": "Total count of anchored confessions"
+        },
+        {
+          "key": "Admin",
+          "type": "Address",
+          "storage_type": "instance",
+          "description": "Contract owner/admin address"
+        }
+      ],
+      "event_schemas": [
+        {
+          "topic": "anchor",
+          "version": 1,
+          "payload_fields": ["confession_hash: BytesN<32>", "timestamp: u64", "author_hash: BytesN<32>"]
+        }
+      ],
+      "authorization": {
+        "admin_functions": ["upgrade", "set_admin"],
+        "public_functions": ["anchor_confession", "verify_confession", "get_confession_count"]
+      },
+      "rollback_constraints": {
+        "downgrade_permitted": false,
+        "storage_backward_compatible": true,
+        "breaking_changes_policy": "additive_keys_only"
+      }
+    },
+    "confession-registry": {
+      "contract_id": "CDS3WZ2CBA2JAIGK2NJ7KOO3VPBFWSJ34FWMMVXEIA7O7ACQO3VWH2PQ",
+      "version": "0.1.0",
+      "sha256": "0a4708682d777075100f5fb7f4e6d3222fef83ccf49a252b0f49c5167bcdfdce",
+      "schema_version": 2,
+      "storage_layout": [
+        {
+          "key": "Admin",
+          "type": "Address",
+          "storage_type": "instance",
+          "description": "Contract owner address"
+        },
+        {
+          "key": "Confession(u64)",
+          "type": "ConfessionRecord",
+          "storage_type": "persistent",
+          "description": "Confession entry by ID"
+        },
+        {
+          "key": "AuthorIndex(Address)",
+          "type": "Vec<u64>",
+          "storage_type": "persistent",
+          "description": "List of confession IDs authored by address"
+        },
+        {
+          "key": "TotalCount",
+          "type": "u64",
+          "storage_type": "instance",
+          "description": "Total registered confessions"
+        },
+        {
+          "key": "SchemaVersion",
+          "type": "u32",
+          "storage_type": "instance",
+          "description": "Current schema version of storage"
+        }
+      ],
+      "event_schemas": [
+        {
+          "topic": "confession_created",
+          "version": 1,
+          "payload_fields": ["id: u64", "author: Address", "content_hash: BytesN<32>", "timestamp: u64"]
+        },
+        {
+          "topic": "schema_migrated",
+          "version": 1,
+          "payload_fields": ["from_version: u32", "to_version: u32"]
+        }
+      ],
+      "authorization": {
+        "admin_functions": ["migrate", "upgrade", "set_admin"],
+        "public_functions": ["create_confession", "get_confession", "get_author_confessions", "get_total_count", "schema_version"]
+      },
+      "rollback_constraints": {
+        "downgrade_permitted": false,
+        "migration_monotonic": true,
+        "breaking_changes_policy": "preserve_existing_keys"
+      }
+    },
+    "anonymous-tipping": {
+      "contract_id": "CC74UWNAAYDTPEPVKR4CPANWJSF6GI2PCI7BLN6M46KB6CSQYVYLHIWM",
+      "version": "1.0.0",
+      "sha256": "38c3d5d76bc026a1a3d25dabc473d9b37a2dd60787145400a1bb327624b76928",
+      "schema_version": 1,
+      "storage_layout": [
+        {
+          "key": "Admin",
+          "type": "Address",
+          "storage_type": "instance",
+          "description": "Contract admin/owner"
+        },
+        {
+          "key": "SettlementNonce",
+          "type": "u64",
+          "storage_type": "instance",
+          "description": "Monotonically increasing settlement counter"
+        },
+        {
+          "key": "RecipientTips(Address)",
+          "type": "i128",
+          "storage_type": "persistent",
+          "description": "Cumulative tips received per recipient"
+        },
+        {
+          "key": "Paused",
+          "type": "bool",
+          "storage_type": "instance",
+          "description": "Emergency pause status flag"
+        },
+        {
+          "key": "RateLimitConfig",
+          "type": "RateLimitConfig",
+          "storage_type": "instance",
+          "description": "Rate limiting window and cap configuration"
+        }
+      ],
+      "event_schemas": [
+        {
+          "topic": "tip_sent",
+          "version": 1,
+          "payload_fields": ["settlement_id: u64", "sender: Address", "recipient: Address", "amount: i128"]
+        },
+        {
+          "topic": "paused",
+          "version": 1,
+          "payload_fields": ["caller: Address", "reason: String"]
+        },
+        {
+          "topic": "unpaused",
+          "version": 1,
+          "payload_fields": ["caller: Address"]
+        }
+      ],
+      "authorization": {
+        "admin_functions": ["configure_controls", "pause", "unpause", "upgrade"],
+        "public_functions": ["send_tip", "get_tips", "latest_settlement_nonce", "is_paused", "get_rate_limit_config"]
+      },
+      "rollback_constraints": {
+        "downgrade_permitted": false,
+        "pause_state_persistent": true,
+        "settlement_nonce_monotonic": true
+      }
+    },
+    "reputation-badges": {
+      "contract_id": "CDAN4HZHY6XNQR3TRPLPJKVKNURVMMQMF7XNZ6AUNJNFLR77J4DNAEYI",
+      "version": "0.0.0",
+      "sha256": "a1737b45c44ded77f714769f3a16fcfb876ae0658e3db5262cc7d64d9c3274f7",
+      "schema_version": 1,
+      "storage_layout": [
+        {
+          "key": "Admin",
+          "type": "Address",
+          "storage_type": "instance",
+          "description": "Contract administrator"
+        },
+        {
+          "key": "Badge(u64)",
+          "type": "BadgeRecord",
+          "storage_type": "persistent",
+          "description": "Badge record containing owner, type, timestamp"
+        },
+        {
+          "key": "UserReputation(Address)",
+          "type": "i128",
+          "storage_type": "persistent",
+          "description": "Aggregated user reputation score"
+        },
+        {
+          "key": "NextBadgeId",
+          "type": "u64",
+          "storage_type": "instance",
+          "description": "Counter for next badge identifier"
+        }
+      ],
+      "event_schemas": [
+        {
+          "topic": "badge_minted",
+          "version": 1,
+          "payload_fields": ["badge_id: u64", "owner: Address", "badge_type: u32"]
+        },
+        {
+          "topic": "reputation_adjusted",
+          "version": 1,
+          "payload_fields": ["user: Address", "delta: i128", "reason: String", "new_total: i128"]
+        }
+      ],
+      "authorization": {
+        "admin_functions": ["mint_badge", "adjust_reputation", "upgrade"],
+        "public_functions": ["get_badge", "get_user_reputation"]
+      },
+      "rollback_constraints": {
+        "downgrade_permitted": false,
+        "score_integrity_guaranteed": true
+      }
+    }
+  }
+}

@@ -3,6 +3,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { AuditLog, AuditActionType } from './audit-log.entity';
 import { AuditLogRedactionService } from './audit-log-redaction.service';
+import { AuditLogIntegrityService } from './audit-log-integrity.service';
 
 export interface AuditLogContext {
   userId?: string | number | null;
@@ -81,6 +82,7 @@ export class AuditLogService {
     @InjectRepository(AuditLog)
     private readonly auditLogRepository: Repository<AuditLog>,
     private readonly redaction: AuditLogRedactionService,
+    private readonly integrity: AuditLogIntegrityService,
   ) {}
 
   private toNullableUserId(value?: string | number | null): number | null {
@@ -189,9 +191,27 @@ export class AuditLogService {
         ipAddress: dto.context?.ipAddress || null,
         userAgent: dto.context?.userAgent || null,
         requestId: dto.context?.requestId || null,
+        integrityHash: null,
       });
 
-      await this.auditLogRepository.save(auditLog);
+      // Persist first to obtain the generated id and database-assigned createdAt
+      const saved = await this.auditLogRepository.save(auditLog);
+
+      // Compute HMAC integrity tag using the persisted values
+      const integrityHash = this.integrity.computeIntegrityHash({
+        id: saved.id,
+        action: saved.action,
+        adminId: saved.adminId,
+        entityType: saved.entityType,
+        entityId: saved.entityId,
+        requestId: saved.requestId,
+        ipAddress: saved.ipAddress,
+        createdAt: saved.createdAt.toISOString(),
+      });
+
+      if (integrityHash) {
+        await this.auditLogRepository.update(saved.id, { integrityHash });
+      }
 
       this.logger.log(
         `Audit log created: ${dto.actionType} by ${actor?.type || 'anonymous'} ${actor?.id || dto.context?.userId || 'anonymous'}`,

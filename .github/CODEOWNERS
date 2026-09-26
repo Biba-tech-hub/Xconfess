@@ -1,0 +1,109 @@
+# CODEOWNERS — contributor dependency graph and ownership map
+#
+# Each area lists at least one primary owner (a GitHub user or team).
+# Owners are automatically added as reviewers when a PR touches their paths.
+#
+# Format:  <glob-pattern>  <owner> [additional-owners...]
+# Docs:    https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+#
+# Ownership is reviewed each Wave. See docs/OWNERSHIP.md for escalation paths
+# and the process for marking ownership stale.
+
+# ── Default / catch-all ─────────────────────────────────────────────────────
+# Any file not matched by a more-specific rule falls here.
+*                                     @yazeed11011
+
+# ── Repo-wide configuration ──────────────────────────────────────────────────
+/.github/                             @yazeed11011
+/.github/CODEOWNERS                   @yazeed11011
+/.github/workflows/                   @yazeed11011
+package.json                          @yazeed11011
+package-lock.json                     @yazeed11011
+compose.yaml                          @yazeed11011
+render.yaml                           @yazeed11011
+tsconfig*.json                        @yazeed11011
+audit-ci.json                         @yazeed11011
+
+# ── Scripts / tooling ────────────────────────────────────────────────────────
+/scripts/                             @yazeed11011
+/scripts/secret-scanning-preflight.sh @yazeed11011
+/scripts/deploy-preflight.js          @yazeed11011
+/scripts/diagnose.js                  @yazeed11011
+
+# ── Documentation ────────────────────────────────────────────────────────────
+/docs/                                @yazeed11011
+README.md                             @yazeed11011
+CONTRIBUTING.md                       @yazeed11011
+/docs/adr/                            @yazeed11011
+
+# ── Backend (NestJS) ─────────────────────────────────────────────────────────
+# Primary subsystem: API, auth, moderation, data-export, Stellar integration.
+/xconfess-backend/                    @yazeed11011
+
+# Auth and session — security-sensitive; requires maintainer sign-off
+/xconfess-backend/src/auth/           @yazeed11011
+
+# Admin RBAC — security-sensitive; requires maintainer sign-off
+/xconfess-backend/src/admin/          @yazeed11011
+
+# Encryption / key-rotation — security-sensitive
+/xconfess-backend/src/encryption/     @yazeed11011
+/xconfess-backend/src/key-rotation/   @yazeed11011
+
+# Database migrations — requires careful ordering; needs maintainer review
+/xconfess-backend/migrations/         @yazeed11011
+/xconfess-backend/src/migrations/     @yazeed11011
+/xconfess-backend/src/database/       @yazeed11011
+
+# Stellar integration — on-chain operations
+/xconfess-backend/src/stellar/        @yazeed11011
+
+# Notifications and queues
+/xconfess-backend/src/notifications/  @yazeed11011
+
+# Moderation
+/xconfess-backend/src/moderation/     @yazeed11011
+
+# Data export / privacy
+/xconfess-backend/src/data-export/    @yazeed11011
+/xconfess-backend/src/export/         @yazeed11011
+
+# Confessions, comments, reactions, messages
+/xconfess-backend/src/confession/     @yazeed11011
+/xconfess-backend/src/comment/        @yazeed11011
+/xconfess-backend/src/reaction/       @yazeed11011
+/xconfess-backend/src/messages/       @yazeed11011
+
+# Analytics
+/xconfess-backend/src/analytics/      @yazeed11011
+
+# ── Frontend (Next.js App Router) ────────────────────────────────────────────
+/xconfess-frontend/                   @yazeed11011
+
+# Auth flows and middleware — security-sensitive
+/xconfess-frontend/app/(auth)/        @yazeed11011
+/xconfess-frontend/app/api/           @yazeed11011
+
+# Admin surfaces
+/xconfess-frontend/app/(dashboard)/   @yazeed11011
+
+# Wallet / Stellar UI
+/xconfess-frontend/components/wallet/ @yazeed11011
+/xconfess-frontend/hooks/useStellarWallet.ts @yazeed11011
+
+# Public-facing styles
+/xconfess-frontend/app/globals.css    @yazeed11011
+/xconfess-frontend/styles/            @yazeed11011
+
+# ── Soroban contracts (Rust) ─────────────────────────────────────────────────
+# On-chain code. Any change requires maintainer review.
+/xconfess-contracts/                  @yazeed11011
+/xconfess-contracts/contracts/confession-anchor/  @yazeed11011
+/xconfess-contracts/contracts/anonymous-tipping/  @yazeed11011
+/xconfess-contracts/contracts/reputation-badges/  @yazeed11011
+/xconfess-contracts/contracts/governance/         @yazeed11011
+/xconfess-contracts/contracts/emergency_pause/    @yazeed11011
+/deployments/                         @yazeed11011
+
+# ── Maintainer tooling ───────────────────────────────────────────────────────
+/maintainer/                          @yazeed11011

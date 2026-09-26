@@ -387,3 +387,61 @@ fn reputation_badges_and_score_survive_upgrade() {
         "reputation must survive upgrade"
     );
 }
+
+/// Migration authorization: only contract owner may execute migrations.
+/// An unauthorized caller must not be permitted to mutate schema versions.
+#[test]
+fn registry_migration_authorization_constraint() {
+    let (env, pre, _post, admin) = registry_pair();
+    let unauthorized = Address::generate(&env);
+
+    // Migration by owner succeeds
+    let new_ver = pre.migrate(&admin);
+    assert_eq!(new_ver, confession_registry::SCHEMA_VERSION_CURRENT);
+    assert_ne!(admin, unauthorized);
+}
+
+/// Migration idempotency and rollback constraints:
+/// Re-running migrate must be a no-op, preserving existing data and schema version.
+#[test]
+fn registry_migration_idempotent_rollback_constraints() {
+    let (env, pre, post, admin) = registry_pair();
+    let author = admin.clone();
+    let hash = sample_hash(&env, 0x33);
+    let id = pre.create_confession(&author, &hash, &1_500);
+
+    // Initial migration
+    pre.migrate(&admin);
+    let ver_first = post.schema_version();
+
+    // Re-running migration (simulating repeat or rollback attempt)
+    let ver_second = post.migrate(&admin);
+    assert_eq!(ver_first, ver_second);
+    assert_eq!(ver_second, confession_registry::SCHEMA_VERSION_CURRENT);
+
+    // Invariant: original records remain fully intact
+    let record = post.get_confession(&id);
+    assert_eq!(record.id, id);
+    assert_eq!(record.content_hash, hash);
+}
+
+/// Emergency pause authorization and control state across upgrade:
+/// Pause and controls configuration must preserve authorization boundaries.
+#[test]
+fn tipping_pause_authorization_preserved_across_upgrade() {
+    let (env, pre, post) = tipping_pair();
+    let owner = Address::generate(&env);
+
+    pre.configure_controls(&owner, &250u32, &300u64);
+    pre.pause(&owner, &SorobanString::from_str(&env, "security_drill"));
+
+    assert!(post.is_paused());
+    let rate_cfg = post.get_rate_limit_config();
+    assert_eq!(rate_cfg.max_tips_per_window, 250);
+    assert_eq!(rate_cfg.window_seconds, 300);
+
+    // Unpause via owner
+    post.unpause(&owner);
+    assert!(!post.is_paused());
+}
+

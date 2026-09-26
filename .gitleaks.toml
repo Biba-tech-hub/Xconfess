@@ -1,0 +1,94 @@
+# .gitleaks.toml — Gitleaks configuration for xConfess
+#
+# This file configures which secret patterns are scanned and which safe
+# allowlist patterns are exempted. It is picked up automatically when
+# `gitleaks detect` is run in CI or locally.
+#
+# Run locally (requires gitleaks CLI):
+#   gitleaks detect --source . --config .gitleaks.toml
+#
+# The xConfess repository also ships its own Python-based scanner that runs
+# in CI without requiring any additional installation:
+#   npm run secret-scan
+#   npm run secret-scan:self-test
+#
+# Safe placeholder values used in .env.example files and documentation are
+# allowlisted below so they do not generate false positives.
+
+title = "xConfess secret scanning rules"
+
+[extend]
+# Use Gitleaks' curated upstream ruleset as the base, then layer xConfess
+# project-specific overrides on top.
+useDefault = true
+
+[[rules]]
+id = "stellar-secret-key"
+description = "Stellar secret seed (private key starting with S, 56 base-32 chars)"
+regex = '''\bS[2-7A-Z]{55}\b'''
+tags = ["stellar", "private-key", "high-severity"]
+
+  [[rules.allowlist]]
+  description = "Safe Stellar placeholders used in docs and env.example files"
+  # Matches SCXXX...XXX (56 X-chars) style and all-zero variants
+  regexes = [
+    '''SC[X]{50,}''',
+    '''S[X]{55}''',
+    '''SXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX''',
+  ]
+
+[[rules]]
+id = "confession-encryption-key"
+description = "Confession encryption key (64-char hex) assigned to a secret env var"
+regex = '''(?i)(?:CONFESSION_ENCRYPTION_KEY|ENCRYPTION_MASTER_KEY_[a-z0-9_]+)\s*=\s*([0-9a-fA-F]{64})'''
+tags = ["encryption-key", "high-severity"]
+
+  [[rules.allowlist]]
+  description = "All-zeros placeholder used in docs and env.example"
+  regexes = [
+    '''0{64}''',
+    '''0{63}[0-9a-fA-F]''',
+  ]
+
+# ---------------------------------------------------------------------------
+# Global allowlist — applies to every rule above
+# ---------------------------------------------------------------------------
+[allowlist]
+description = "Project-wide false-positive exemptions"
+
+# Allowlisted files — test specs, lock files, and this config itself are
+# intentionally excluded from scanning.
+paths = [
+  ".gitleaks.toml",
+  "package-lock.json",
+  "Cargo.lock",
+  "audit-report.json",
+  # The scanner implementation references its own patterns for self-testing
+  "scripts/secret-scanning-preflight.sh",
+]
+
+# Allowlisted commit SHAs — add verified-safe commits here if gitleaks flags
+# a historical commit that has already been remediated.
+commits = []
+
+# Allowlisted regex patterns across all files — covers safe placeholder values
+# that appear in documentation, README, and env.example templates.
+regexes = [
+  # All-zeros hex key placeholders (64 chars of 0 or near-zero)
+  '''0{60,}''',
+  # Local-dev placeholder strings from env.example
+  '''local-dev-jwt-secret''',
+  '''local-dev-app-secret''',
+  # Documentation angle-bracket placeholders
+  '''<stellar-[a-z-]+>''',
+  # Generic uppercase placeholders used in doc tables
+  '''YOUR_SECRET''',
+  '''PLACEHOLDER''',
+  # Redaction tags
+  '''\[REDACTED''',
+  # SHA-256 / integrity hashes in deployment manifests
+  '''"sha256"''',
+  '''"integrity"''',
+  # Test fixture strings inserted by the scanner self-test
+  '''SD234567QWERTYUIOPASDFGHJKLZXCVBNM''',
+]

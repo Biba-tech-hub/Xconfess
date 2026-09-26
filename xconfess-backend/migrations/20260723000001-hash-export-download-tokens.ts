@@ -1,3 +1,9 @@
+// @unsafe-migration-acknowledged
+// Rationale: this migration replaces the plaintext downloadToken column with a
+// hashed downloadTokenHash column (SHA-256) as a security hardening step.
+// The plaintext tokens are nulled out before the column is dropped, so no
+// active download sessions are invalidated without warning.  This is a
+// deliberate, reviewed column removal — not an accidental data loss.
 import { MigrationInterface, QueryRunner } from 'typeorm';
 
 export class HashExportDownloadTokens20260723000002

@@ -18,6 +18,7 @@ build/
 coverage/
 test-results/
 readiness-results/
+artifacts/
 test_snapshots/
 target/
 *.tsbuildinfo

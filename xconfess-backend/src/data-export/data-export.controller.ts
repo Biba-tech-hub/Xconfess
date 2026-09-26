@@ -25,6 +25,7 @@ import * as crypto from 'crypto';
 import { DataExportService } from './data-export.service';
 import { ConfigService } from '@nestjs/config';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { RequestCost, COST } from '../common/guards/cost-throttler.guard';
 
 @ApiTags('Data Export')
 @Controller('data-export')
@@ -37,6 +38,7 @@ export class DataExportController {
   @UseGuards(JwtAuthGuard)
   @ApiBearerAuth()
   @Post('request')
+  @RequestCost(COST.HIGH) // export generation is expensive — deducts 5 budget tokens
   @ApiOperation({ summary: 'Request a GDPR data export' })
   @ApiResponse({ status: 201, description: 'Export requested successfully.' })
   @ApiResponse({ status: 401, description: 'Unauthorized.' })
@@ -77,6 +79,25 @@ export class DataExportController {
   @ApiResponse({ status: 200, description: 'Redownload link generated.' })
   async redownload(@Param('id') id: string, @Req() req: any) {
     return this.exportService.getRedownloadLink(id, String(req.user.id));
+  }
+
+  /**
+   * POST /data-export/:id/cancel
+   *
+   * Issue #106: Cancel a PENDING or PROCESSING export. Partial chunks are
+   * cleaned up immediately so no incomplete artifacts remain accessible.
+   */
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
+  @Post(':id/cancel')
+  @ApiOperation({ summary: 'Cancel a pending or in-progress export' })
+  @ApiParam({ name: 'id', description: 'Export request UUID' })
+  @ApiResponse({ status: 200, description: 'Export cancelled.' })
+  @ApiResponse({ status: 400, description: 'Export cannot be cancelled in its current state.' })
+  @ApiResponse({ status: 404, description: 'Export request not found.' })
+  async cancelExport(@Param('id') id: string, @Req() req: any) {
+    await this.exportService.cancelExport(id, String(req.user.id));
+    return { message: 'Export cancelled successfully.' };
   }
 
   @Get('download/:id')

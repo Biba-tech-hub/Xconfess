@@ -97,6 +97,67 @@ Any change to a Soroban event schema (e.g., adding a field, changing a type) mus
 ### Compatibility Validation
 The backend Stellar event tests rely on these fixtures. If the backend fails to parse the new fixtures, the contract changes cannot be safely deployed without accompanying backend updates.
 
+## Checkpointed Event Ingestion and Replay
+
+The backend event ingestor consumes these fixtures while replaying Soroban
+events. To keep replay deterministic across RPC gaps, deploys, and parser
+changes, the ingestor persists a checkpoint and dedupes events by identity.
+
+### Checkpoint Persistence
+After each successfully processed ledger the ingestor writes a checkpoint
+recording the last processed ledger sequence and the last processed event
+identity (`ledger + tx_hash + event_index`). On restart the ingestor resumes
+from this checkpoint instead of the chain head, so recovery is lossless and
+idempotent. A checkpoint is only advanced after the events for that ledger are
+committed, so a crash mid-ledger replays that ledger rather than skipping it.
+
+### Bounded Replay
+Replay is bounded to a configurable ledger/event range starting from the
+checkpoint. Operators set the replay window (for example `REPLAY_FROM_LEDGER`
+and `REPLAY_MAX_LEDGERS`) so a restart reprocesses at most the configured
+window. Replaying a range that overlaps already-processed ledgers is safe
+because duplicate suppression is idempotent.
+
+### Duplicate Suppression
+Events are deduped by their identity (`ledger + tx_hash + event_index`). An
+event whose identity was already committed is skipped, so overlapping replay
+windows and RPC re-delivery never double-apply an event. Dedupe state is
+persisted alongside the checkpoint so suppression survives restarts.
+
+### Gap Detection
+When the ingestor observes a ledger sequence that is not contiguous with the
+checkpoint (a gap), it records a gap metric and refuses to advance the
+checkpoint past the gap until the missing ledgers are replayed. This makes gaps
+detectable rather than silently skipped.
+
+### Parser Version Handling
+Each checkpoint records the parser version that produced it. When the parser
+version changes, the ingestor triggers a controlled reprocessing of the
+configured replay window instead of silently mixing old and new parse results.
+A parser version bump therefore follows the same review path as an
+`event_version` bump: update the parser, replay from the checkpoint, and verify
+backend compatibility suites pass.
+
+### Replay Metrics
+Replay emits metrics for observability: `events_processed`,
+`events_deduplicated`, `ledgers_replayed`, `checkpoint_ledger`, and
+`gaps_detected`. Alert on `gaps_detected > 0` and on a `checkpoint_ledger` that
+stops advancing while the chain head moves forward.
+
+### Runbook Steps
+1. **Restart from checkpoint** — confirm the ingestor logs the resumed
+   `checkpoint_ledger` and does not reprocess committed ledgers.
+2. **Replay a bounded window** — set the replay range, restart, and verify
+   `ledgers_replayed` matches the configured window and
+   `events_deduplicated` accounts for already-committed events.
+3. **Investigate a gap** — when `gaps_detected` fires, replay the missing
+   ledger range from the last good checkpoint before advancing.
+4. **Parser version change** — bump the parser version, replay the configured
+   window, and confirm `events_processed` covers the window with no decode
+   errors before advancing the checkpoint.
+5. **Rollback** — if a replay applies bad data, restore the previous checkpoint
+   and dedupe state, then replay the bounded window with the corrected parser.
+
 ## References
 * **[Event version bump checklist](./contract-event-version-bump-checklist.md)** — contract files, backend fixture tests, changelog template, and version increment rules.
 * Backend fixture tests: [`xconfess-backend/src/stellar/__tests__/contract-event-fixtures.spec.ts`](../xconfess-backend/src/stellar/__tests__/contract-event-fixtures.spec.ts), [`xconfess-backend/src/tipping/contract-fixtures.spec.ts`](../xconfess-backend/src/tipping/contract-fixtures.spec.ts)

@@ -1,0 +1,95 @@
+name: Security concern
+description: Report a security gap, hardening task, or threat model update. Not for live vulnerability disclosure.
+title: "[Security] "
+labels: ["security"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not report live vulnerabilities or credential exposures here.**
+        For active security incidents, follow the process in [docs/incident-runbook.md](https://github.com/Xconfess/Xconfess/blob/main/docs/incident-runbook.md).
+
+        Use this template for hardening work, threat model updates, or security-adjacent tasks that are safe to discuss publicly.
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: Category
+      options:
+        - Authentication / authorization
+        - Encryption / key management
+        - Input validation / injection
+        - Dependency vulnerability
+        - Threat model update
+        - Secret scanning / credential hygiene
+        - Privacy / data exposure
+        - Contract / on-chain security
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Describe the security gap or hardening task without revealing exploit details.
+    validations:
+      required: true
+
+  - type: textarea
+    id: threat_model
+    attributes:
+      label: Threat model impact
+      description: Which threat actors or attack surfaces does this affect? Reference docs/contract-threat-model.md or docs/websocket-threat-model.md if relevant.
+      placeholder: |
+        Attacker capability: ...
+        Asset at risk: ...
+        Current control: ...
+        Gap: ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: What files, modules, or services are in scope?
+      placeholder: |
+        In scope:
+        -
+
+        Out of scope:
+        -
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Testable security checks a reviewer can verify.
+      placeholder: |
+        - [ ] Failing test added that demonstrates the gap
+        - [ ] Fix applied and test now passes
+        - [ ] No secrets in committed files (npm run secret-scan passes)
+        - [ ] Authorization path tested (authenticated + unauthenticated cases)
+        - [ ] Threat model doc updated if attack surface changes
+    validations:
+      required: true
+
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation
+      description: Exact commands to prove the fix.
+      placeholder: |
+        npm run preflight && npm run ci
+        npm run secret-scan
+    validations:
+      required: true
+
+  - type: textarea
+    id: assumptions
+    attributes:
+      label: Assumptions and follow-up
+      description: Call out any assumptions made and what follow-up work this reveals.

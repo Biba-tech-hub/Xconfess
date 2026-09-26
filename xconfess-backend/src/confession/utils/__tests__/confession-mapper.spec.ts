@@ -52,6 +52,7 @@ describe('confession-mapper', () => {
         view_count: 5,
         isAnchored: true,
         stellarTxHash: '0x123',
+        contentWarning: false,
         reactions: [
           { type: 'like', count: 1 },
           { type: 'love', count: 1 },

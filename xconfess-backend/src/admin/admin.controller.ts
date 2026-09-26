@@ -40,6 +40,7 @@ import { Request } from 'express';
 import { GetUser } from '../auth/get-user.decorator';
 import { RequestUser } from '../auth/interfaces/jwt-payload.interface';
 import { StellarDiagnosticsService } from './services/stellar-diagnostics.service';
+import { DiagnosticsBundleService } from './services/diagnostics-bundle.service';
 import {
   IsString,
   IsEnum,
@@ -133,6 +134,7 @@ export class AdminController {
     private readonly moderationTemplateService: ModerationTemplateService,
     private readonly auditLogService: AuditLogService,
     private readonly stellarDiagnosticsService: StellarDiagnosticsService,
+    private readonly diagnosticsBundleService: DiagnosticsBundleService,
   ) {}
 
   // Reports
@@ -726,5 +728,50 @@ export class AdminController {
     const start = startDate ? new Date(startDate) : undefined;
     const end = endDate ? new Date(endDate) : undefined;
     return this.auditLogService.getObservabilityMetrics(start, end);
+  }
+
+  /**
+   * Incident diagnostics bundle
+   *
+   * Assembles a time-bounded, redacted snapshot of system state suitable
+   * for sharing with an incident responder.  The bundle includes:
+   *   - Runtime meta (node version, uptime, env)
+   *   - App version and git commit
+   *   - Dependency reachability (database)
+   *   - Applied / pending migrations
+   *   - Recent queue action counts from audit logs
+   *   - Recent error-class counts from audit logs
+   *   - Non-sensitive config keys (all secrets redacted)
+   *
+   * Requires admin authentication.
+   * Secrets, confession content, message bodies, and PII are NEVER included.
+   *
+   * @param windowMinutes  Lookback window in minutes for recent errors (default 30)
+   */
+  @Get('diagnostics/bundle')
+  @ApiOperation({
+    summary: 'Generate incident diagnostics bundle',
+    description:
+      'Produces a redacted, time-bounded diagnostics snapshot. ' +
+      'Safe to share with incident responders — no secrets or user content. ' +
+      'Requires admin authentication.',
+  })
+  @ApiQuery({
+    name: 'windowMinutes',
+    required: false,
+    type: Number,
+    description: 'Error lookback window in minutes (default: 30)',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Diagnostics bundle generated successfully',
+  })
+  async getDiagnosticsBundle(
+    @Query('windowMinutes') windowMinutes?: string,
+  ) {
+    const window = windowMinutes
+      ? Math.min(Math.max(parseInt(windowMinutes, 10) || 30, 1), 1440)
+      : 30;
+    return this.diagnosticsBundleService.build(window);
   }
 }

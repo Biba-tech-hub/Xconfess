@@ -431,6 +431,64 @@ export class DataExportService {
     });
   }
 
+  /**
+   * Cancel a PENDING or PROCESSING export.
+   *
+   * Issue #106: Clients can cancel in-flight exports so resources are freed
+   * and partial artifacts never become accessible. The processor checks for
+   * CANCELLED status before each write phase, skipping further work.
+   *
+   * - PENDING jobs are cancelled immediately (no work has started).
+   * - PROCESSING jobs are flagged CANCELLED; the processor detects this on its
+   *   next checkpoint and aborts, then deletes any partial chunks.
+   */
+  async cancelExport(requestId: string, userId: string): Promise<void> {
+    const exportReq = await this.exportRepository.findOne({
+      where: { id: requestId, userId },
+    });
+
+    if (!exportReq) {
+      throw new NotFoundException('Export request not found.');
+    }
+
+    if (!['PENDING', 'PROCESSING'].includes(exportReq.status)) {
+      throw new BadRequestException(
+        `Cannot cancel an export with status ${exportReq.status}.`,
+      );
+    }
+
+    await this.exportRepository.update(requestId, {
+      status: 'CANCELLED' as any,
+      lastFailureReason: 'cancelled_by_user',
+    });
+
+    // Delete any partial chunks so partial artifacts are never accessible.
+    await this.chunkRepository.delete({ exportRequestId: requestId });
+
+    await this.auditLogService
+      ?.logExportLifecycleEvent({
+        action: 'request_created', // reusing closest available action type
+        actorType: 'user',
+        actorId: userId,
+        requestId,
+        exportId: requestId,
+        metadata: { action: 'cancelled', previousStatus: exportReq.status },
+      })
+      .catch(() => undefined);
+  }
+
+  /**
+   * Returns true if the export has been cancelled by the user.
+   * Called by ExportProcessor at each checkpoint to abort early.
+   */
+  async isExportCancelled(requestId: string): Promise<boolean> {
+    const req = await this.exportRepository.findOne({
+      where: { id: requestId },
+      select: ['status'] as any,
+    });
+    return req?.status === ('CANCELLED' as any);
+  }
+
   async markExportGenerated(
     requestId: string,
     userId: string,

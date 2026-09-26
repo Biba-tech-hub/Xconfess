@@ -87,6 +87,146 @@ An indexer should park `retryable: true` failures in a dead-letter/replay
 queue to reprocess after the next backend deploy, and alert immediately on
 `retryable: false` failures since those require a code or data fix.
 
+## Checkpointed ingestion & bounded replay
+
+Parsing is pure, but ingestion is stateful: the indexer must survive RPC
+gaps, backend deploys, and parser-version bumps without losing or
+double-applying events. The ingestion layer wraps the parser with a durable
+cursor, bounded replay, idempotent dedupe, and parser-version tracking.
+
+### Cursor / checkpoint persistence
+
+The indexer persists a single checkpoint record after each successfully
+applied batch. The checkpoint is the resume point for the next run:
+
+```ts
+interface IngestionCheckpoint {
+  /** Last ledger sequence fully applied (inclusive). */
+  lastLedger: number;
+  /** Last event position within `lastLedger` (paging cursor). */
+  lastEventIndex: number;
+  /** Parser version that produced the applied events. */
+  parserVersion: string;
+  /** Monotonic run counter, for metrics and runbook correlation. */
+  runId: number;
+  /** ISO-8601 timestamp of the last successful commit. */
+  committedAt: string;
+}
+```
+
+Rules:
+
+- **Commit after apply, never before.** The checkpoint advances only once
+  the batch's side effects are durable. A crash mid-batch replays that batch
+  from the previous checkpoint — safe because apply is idempotent (below).
+- **Single writer.** Only one indexer process may advance the checkpoint at a
+  time (advisory lock / leader election). Concurrent writers would interleave
+  cursors and skip ledgers.
+- **Restart is lossless.** On boot the indexer reads the checkpoint and
+  resumes at `(lastLedger, lastEventIndex + 1)`. If no checkpoint exists it
+  starts from the configured `startLedger`.
+
+### Bounded replay
+
+Replay is always bounded by an explicit range so a bad checkpoint can't
+re-scan the whole chain:
+
+```ts
+interface ReplayRequest {
+  fromLedger: number;      // inclusive
+  toLedger: number;        // inclusive
+  maxLedgers: number;      // hard cap; reject ranges wider than this
+  reason: 'gap' | 'parser-upgrade' | 'manual' | 'rollback';
+}
+```
+
+- The indexer rejects any `ReplayRequest` whose width exceeds `maxLedgers`
+  (default 10_000) with a typed error — operators must chunk larger replays.
+- Replay reuses the same apply path as live ingestion, so dedupe and
+  checkpointing behave identically.
+- **Gap detection**: if the RPC returns a ledger sequence greater than
+  `lastLedger + 1`, the indexer records a `GAP_DETECTED` metric and emits a
+  bounded replay request for the missing range before continuing. Gaps are
+  never silently skipped.
+
+### Duplicate suppression (idempotent apply)
+
+Every event has a stable identity derived from its on-chain coordinates:
+
+```ts
+function eventIdentity(e: RawContractEvent): string {
+  return `${e.ledger}:${e.txHash}:${e.eventIndex}`;
+}
+```
+
+- The apply step is keyed on `eventIdentity`. A unique index on that key
+  makes re-applying a replayed event a no-op (`ON CONFLICT DO NOTHING`).
+- Dedupe is enforced at the storage layer, not in memory, so it holds across
+  process restarts and concurrent replays.
+- The indexer counts `events_applied` vs `events_deduped` per batch; a
+  non-zero dedupe count during live (non-replay) ingestion is a warning sign
+  of overlapping cursors and should alert.
+
+### Parser version handling
+
+The checkpoint records the `parserVersion` that produced the applied events.
+On boot the indexer compares it to the running parser version:
+
+| Situation | Action |
+| --- | --- |
+| `checkpoint.parserVersion === running` | Resume normally from the checkpoint. |
+| `checkpoint.parserVersion < running` (parser upgraded) | Do **not** silently continue. Emit a bounded `parser-upgrade` replay over the affected range so events parsed under the old schema are re-derived under the new one. Dedupe makes this safe. |
+| `checkpoint.parserVersion > running` (backend rolled back) | Halt ingestion and alert. A newer parser wrote the checkpoint; an older parser must not overwrite it. Requires an explicit operator decision. |
+
+Parser-version bumps therefore trigger **controlled reprocessing**, never
+silent corruption: the old events are re-parsed and re-applied idempotently,
+and the checkpoint's `parserVersion` is advanced only after the replay
+commits.
+
+### Replay metrics
+
+The indexer exports these counters/gauges (Prometheus naming):
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `indexer_checkpoint_ledger` | gauge | Current `lastLedger`. |
+| `indexer_events_applied_total` | counter | Events applied (post-dedupe). |
+| `indexer_events_deduped_total` | counter | Events suppressed as duplicates. |
+| `indexer_gaps_detected_total` | counter | Ledger gaps detected. |
+| `indexer_replay_ledgers_total` | counter | Ledgers re-scanned via replay. |
+| `indexer_parser_version_mismatch_total` | counter | Boots where checkpoint/running parser versions differed. |
+| `indexer_parse_errors_total{code,retryable}` | counter | Parser failures by classification. |
+
+### Runbook
+
+**Resume after a crash / deploy**
+1. Confirm the checkpoint: `indexer_checkpoint_ledger` and the persisted
+   `IngestionCheckpoint` agree.
+2. Start the indexer. It resumes at `(lastLedger, lastEventIndex + 1)`.
+3. Watch `indexer_events_deduped_total` — a small bump is expected for the
+   in-flight batch; a sustained climb means overlapping writers.
+
+**Recover from a detected gap**
+1. Alert fires on `indexer_gaps_detected_total`.
+2. Issue a bounded `ReplayRequest { reason: 'gap' }` covering the missing
+   range (chunked to `maxLedgers`).
+3. Verify `indexer_checkpoint_ledger` advances past the gap and
+   `indexer_events_deduped_total` stays flat.
+
+**After a parser upgrade**
+1. Deploy the new parser. On boot the indexer detects
+   `checkpoint.parserVersion < running` and emits a `parser-upgrade` replay.
+2. Confirm `indexer_parser_version_mismatch_total` incremented once and
+   `indexer_replay_ledgers_total` covers the affected range.
+3. Confirm the checkpoint's `parserVersion` advanced only after the replay
+   committed.
+
+**Rollback (backend older than checkpoint)**
+1. Ingestion halts with a `parserVersion > running` alert.
+2. Do **not** force-advance the checkpoint. Either redeploy the newer parser
+   or, if the rollback is intentional, take a manual checkpoint snapshot and
+   record the decision in the incident log before resetting.
+
 ## How to add a new event version safely
 
 1. Update `docs/contract-abi-reference.md` § "Public Event Schema Fixtures"
@@ -111,37 +251,20 @@ There's no cross-language fixture loader (Rust `cargo test` and TypeScript
 `jest` don't share a runtime), so parity is enforced transitively through
 `docs/contract-abi-reference.md` as the single shared source of truth:
 
-- **Contract side**: `xconfess-contracts/contracts/events.rs` defines
-  `PUBLIC_EVENT_SCHEMA_FIXTURES`, and its test
-  `events::tests::public_event_metadata_matches_documented_abi` asserts every
-  entry's event name and fields literally appear in the ABI reference doc.
+- **Contract side**: `xconfess-contracts/contracts/events.rs` exports
+  `PUBLIC_EVENT_SCHEMA_FIXTURES`, and a Rust test asserts it matches the doc
+  table.
 - **Backend side**: `contract-event-parser.doc-parity.spec.ts` parses the
-  same "Public Event Schema Fixtures" markdown table and asserts
-  `contract-event-parser.ts`'s registry matches it exactly — same topics,
-  same field order, same row count, in both directions (no undocumented
-  registry entries, no unregistered doc rows).
+  same doc table and asserts `EVENT_SCHEMAS` matches it row-for-row.
 
-If both tests pass, the contract registry and the backend registry agree,
-because both are pinned to the same doc. A change to either registry that
-isn't reflected in the doc — or a doc change not reflected in the registry —
-fails on whichever side didn't update.
+Because both sides are pinned to the same doc, a contract change that isn't
+mirrored in the backend (or vice-versa) fails CI on one side or the other.
 
-## Running the tests
+## Test commands
 
 ```bash
-# Backend — fixture coverage, fixture/registry parity, error classification,
-# and contract/backend parity via the shared ABI doc
-cd xconfess-backend
-npx jest --config jest.config.js src/stellar/event-parser
-
-# Contract — asserts PUBLIC_EVENT_SCHEMA_FIXTURES matches the same doc
-cd xconfess-contracts
-cargo test -p confession-registry --lib public_event_metadata_matches_documented_abi
+npm run contract:fmt:check
+npm run contract:lint
+npm run contract:test
+npm run contract:build:release
 ```
-
-Current status: **54/54 backend tests passing** (fixture coverage for all 9
-event categories — anchor, tip, confession, reaction, report, role,
-governance, badge, reputation, plus pause under the tipping contract's pause
-control — fixture/registry parity, error-classification for all three typed
-error codes, and 24 doc-parity assertions) and the contract-side
-`public_event_metadata_matches_documented_abi` test passing.

@@ -6,6 +6,7 @@ import { RedisHealthIndicator } from './redis.health';
 import { SchemaReadinessHealthIndicator } from './schema-readiness.health';
 import { QueueHealthIndicator } from './queue.health';
 import { PostgresHealthIndicator } from './postgres.health';
+import { ReplicaLagHealthIndicator } from './replica-lag.health';
 
 // Inlined to keep the health module self-contained and avoid importing from
 // feature-module internals.
@@ -27,6 +28,8 @@ const MONITORED_QUEUES = [
     RedisHealthIndicator,
     SchemaReadinessHealthIndicator,
     QueueHealthIndicator,
+    ReplicaLagHealthIndicator, // Issue #107: observable read replica lag
   ],
+  exports: [CircuitBreakerService],
 })
 export class HealthModule {}

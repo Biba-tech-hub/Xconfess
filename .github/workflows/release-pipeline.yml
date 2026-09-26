@@ -1,0 +1,532 @@
+name: Release Pipeline
+
+# Staged release pipeline with promotion gates.
+#
+# Stages:
+#   1. build       — compile, lint, test; produce immutable artifacts tagged with commit SHA
+#   2. staging     — deploy artifacts to staging; run smoke tests
+#   3. gate        — manual approval required before production promotion
+#   4. production  — promote identical artifacts to production
+#   5. smoke-prod  — verify production health; auto-rollback on failure
+#
+# Artifact identity is preserved end-to-end: the same artifact hash that
+# passes staging is the one promoted to production.
+#
+# Rollback: re-run this workflow targeting the previous known-good SHA, or
+# run it against `main` after reverting the bad commit.  Rollback points
+# are anchored to run IDs which retain artifacts for ARTIFACT_RETENTION_DAYS.
+#
+# Requires the following GitHub Environments to be configured:
+#   - staging    (no required reviewers)
+#   - production (required reviewer(s) configured in Settings → Environments)
+#
+# Required secrets (per environment):
+#   DEPLOY_HOST, DEPLOY_USER, DEPLOY_SSH_KEY,
+#   BACKEND_ENV_FILE, BACKEND_API_URL, NEXT_PUBLIC_API_URL
+#
+# Optional secrets:
+#   STAGING_URL   — base URL used for post-deploy smoke test (staging env)
+#   PRODUCTION_URL — base URL for production smoke test
+
+on:
+  push:
+    branches:
+      - main
+    # Only trigger on app-affecting changes
+    paths:
+      - 'xconfess-backend/**'
+      - 'xconfess-frontend/**'
+      - 'xconfess-contracts/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/release-pipeline.yml'
+      - 'scripts/**'
+  workflow_dispatch:
+    inputs:
+      target_environment:
+        description: "Target environment (staging | production)"
+        required: true
+        default: staging
+        type: choice
+        options:
+          - staging
+          - production
+      reason:
+        description: "Reason / release notes (displayed in summary)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  actions: read
+
+# Never run two release pipelines for the same target concurrently.
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.target_environment || 'staging' }}
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  NEXT_TELEMETRY_DISABLED: '1'
+  ARTIFACT_RETENTION_DAYS: 14
+
+# ── Stage 1: Build ────────────────────────────────────────────────────────────
+jobs:
+  build:
+    name: "Stage 1 · Build & test artifacts"
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: xconfess
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d xconfess"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      NODE_ENV: test
+      APP_ENV: ci
+      PORT: 5000
+      FRONTEND_URL: http://localhost:3000
+      BACKEND_URL: http://localhost:5000
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: xconfess
+      TYPEORM_SYNCHRONIZE: true
+      TYPEORM_MIGRATIONS_RUN: false
+      JWT_SECRET: ci-jwt-secret-release-pipeline-32-chars
+      APP_SECRET: ci-app-secret-release-pipeline-32-chars
+      CONFESSION_ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000000"
+      ENABLE_BACKGROUND_JOBS: false
+      REDIS_HOST: localhost
+      REDIS_PORT: 6379
+      STELLAR_FEATURES_ENABLED: false
+      BACKEND_API_URL: http://localhost:5000/api
+      NEXT_PUBLIC_API_URL: http://localhost:5000/api
+      NEXT_PUBLIC_WS_URL: ws://localhost:5000
+      NEXT_PUBLIC_APP_URL: http://localhost:3000
+      NEXT_PUBLIC_STELLAR_NETWORK: testnet
+      NEXT_PUBLIC_STELLAR_CONTRACT_ID: CBFR2MDZBQPTNBIJCT32MTDDQLW2AQNDWNO777F3QT6ANYKTHETQZWD3
+      NEXT_PUBLIC_DEV_BYPASS_AUTH: "false"
+
+    outputs:
+      artifact_id: ${{ steps.artifact-id.outputs.artifact_id }}
+      commit_sha:  ${{ github.sha }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install npm 10.9.3
+        run: npm install --global npm@10.9.3
+
+      - name: Install dependencies
+        run: npm ci --include=optional --no-audit --no-fund
+
+      # Secret scan before anything else touches secrets
+      - name: Secret scan
+        run: npm run secret-scan
+
+      # Run the full CI suite: lint, typecheck, test, build
+      - name: CI — backend
+        run: npm run ci:backend
+
+      - name: CI — frontend
+        run: npm run ci:frontend
+
+      # Rust contracts
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: xconfess-contracts
+
+      - name: CI — contracts
+        run: npm run ci:contract
+
+      # Compute a stable artifact identifier (short SHA)
+      - name: Set artifact ID
+        id: artifact-id
+        run: echo "artifact_id=xconfess-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Upload immutable build artifacts tagged with commit SHA
+      - name: Upload backend artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact-id.outputs.artifact_id }}-backend
+          path: xconfess-backend/dist
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+          if-no-files-found: error
+
+      - name: Upload frontend artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact-id.outputs.artifact_id }}-frontend
+          path: xconfess-frontend/.next
+          retention-days: ${{ env.ARTIFACT_RETENTION_DAYS }}
+          if-no-files-found: error
+
+      - name: Build summary
+        run: |
+          {
+            echo "## Stage 1 · Build passed"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Commit | \`${{ github.sha }}\` |"
+            echo "| Artifact ID | \`${{ steps.artifact-id.outputs.artifact_id }}\` |"
+            echo "| Triggered by | @${{ github.actor }} |"
+            echo "| Reason | ${{ github.event.inputs.reason || 'push to main' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+# ── Stage 2: Deploy to staging ────────────────────────────────────────────────
+  staging:
+    name: "Stage 2 · Deploy to staging"
+    needs: build
+    runs-on: ubuntu-latest
+    environment: staging
+    # Skip staging-only deploy when workflow_dispatch targets production directly
+    if: |
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' &&
+       (github.event.inputs.target_environment == 'staging' || github.event.inputs.target_environment == 'production'))
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: Add host to known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Download backend artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact_id }}-backend
+          path: xconfess-backend/dist
+
+      - name: Download frontend artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact_id }}-frontend
+          path: xconfess-frontend/.next
+
+      - name: Write backend env
+        run: |
+          cat > xconfess-backend/.env.deploy <<EOF
+          ${{ secrets.BACKEND_ENV_FILE }}
+          EOF
+
+      - name: Write frontend env
+        run: |
+          cat > xconfess-frontend/.env.production <<EOF
+          BACKEND_API_URL=${{ secrets.BACKEND_API_URL }}
+          NEXT_PUBLIC_API_URL=${{ secrets.NEXT_PUBLIC_API_URL }}
+          EOF
+
+      - name: Sync backend to staging
+        run: |
+          rsync -az --delete \
+            --exclude='.git' --exclude='node_modules' \
+            xconfess-backend/ \
+            "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:~/xconfess-staging/backend/"
+
+      - name: Install & restart backend (staging)
+        run: |
+          ssh "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" bash -s <<'REMOTE'
+            set -euo pipefail
+            cd ~/xconfess-staging/backend
+            cp .env.deploy .env
+            npm ci --omit=dev
+            pm2 reload xconfess-backend-staging --update-env \
+              || pm2 start dist/main.js --name xconfess-backend-staging
+          REMOTE
+
+      - name: Verify staging backend health
+        id: staging-health
+        run: |
+          echo "Waiting for staging backend..."
+          for i in $(seq 1 12); do
+            if ssh "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
+                 "curl -sf http://localhost:5001/api/health/ready" 2>/dev/null; then
+              echo "Staging backend healthy."
+              exit 0
+            fi
+            echo "Attempt $i/12 — waiting 5s..."
+            sleep 5
+          done
+          echo "::error::Staging backend did not become healthy."
+          exit 1
+
+      - name: Sync frontend to staging
+        run: |
+          rsync -az --delete \
+            --exclude='.git' --exclude='node_modules' \
+            xconfess-frontend/ \
+            "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:~/xconfess-staging/frontend/"
+
+      - name: Install & restart frontend (staging)
+        run: |
+          ssh "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" bash -s <<'REMOTE'
+            set -euo pipefail
+            cd ~/xconfess-staging/frontend
+            npm ci --omit=dev
+            pm2 reload xconfess-frontend-staging --update-env \
+              || pm2 start npm --name xconfess-frontend-staging -- start
+          REMOTE
+
+      # Run the smoke tests against the staging URL if configured
+      - name: Smoke test (staging)
+        if: ${{ vars.STAGING_URL != '' || secrets.STAGING_URL != '' }}
+        env:
+          DEPLOYED_URL: ${{ vars.STAGING_URL || secrets.STAGING_URL }}
+        run: node scripts/deployed-smoke.js
+        continue-on-error: false
+
+      - name: Staging summary
+        if: always()
+        run: |
+          {
+            echo "## Stage 2 · Staging deploy"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Artifact | \`${{ needs.build.outputs.artifact_id }}\` |"
+            echo "| Commit | \`${{ needs.build.outputs.commit_sha }}\` |"
+            echo "| Health check | ${{ steps.staging-health.outcome }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+# ── Stage 3: Manual promotion gate ───────────────────────────────────────────
+  gate:
+    name: "Stage 3 · Manual approval gate"
+    needs: [build, staging]
+    runs-on: ubuntu-latest
+    # The 'production' GitHub Environment must have required reviewers configured.
+    environment: production
+    # Only proceed to production when staging succeeded and this is either a
+    # push-to-main pipeline or a workflow_dispatch targeting production.
+    if: |
+      needs.staging.result == 'success' &&
+      (github.event_name == 'push' ||
+       (github.event_name == 'workflow_dispatch' &&
+        github.event.inputs.target_environment == 'production'))
+
+    steps:
+      - name: Gate passed
+        run: |
+          echo "Manual approval received. Promoting artifact ${{ needs.build.outputs.artifact_id }} to production."
+          echo "Commit: ${{ needs.build.outputs.commit_sha }}"
+
+# ── Stage 4: Deploy to production ─────────────────────────────────────────────
+  production:
+    name: "Stage 4 · Deploy to production"
+    needs: [build, staging, gate]
+    runs-on: ubuntu-latest
+    environment: production
+    if: needs.gate.result == 'success'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: Add host to known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
+
+      # Download the SAME artifacts that were verified in staging
+      - name: Download backend artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact_id }}-backend
+          path: xconfess-backend/dist
+
+      - name: Download frontend artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact_id }}-frontend
+          path: xconfess-frontend/.next
+
+      - name: Write backend env
+        run: |
+          cat > xconfess-backend/.env.deploy <<EOF
+          ${{ secrets.BACKEND_ENV_FILE }}
+          EOF
+
+      - name: Write frontend env
+        run: |
+          cat > xconfess-frontend/.env.production <<EOF
+          BACKEND_API_URL=${{ secrets.BACKEND_API_URL }}
+          NEXT_PUBLIC_API_URL=${{ secrets.NEXT_PUBLIC_API_URL }}
+          EOF
+
+      - name: Sync backend to production
+        run: |
+          rsync -az --delete \
+            --exclude='.git' --exclude='node_modules' \
+            xconfess-backend/ \
+            "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:~/xconfess/backend/"
+
+      - name: Install & restart backend (production)
+        run: |
+          ssh "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" bash -s <<'REMOTE'
+            set -euo pipefail
+            cd ~/xconfess/backend
+            cp .env.deploy .env
+            npm ci --omit=dev
+            pm2 reload xconfess-backend --update-env \
+              || pm2 start dist/main.js --name xconfess-backend
+          REMOTE
+
+      - name: Verify production backend health
+        id: prod-health
+        run: |
+          echo "Waiting for production backend..."
+          for i in $(seq 1 12); do
+            if ssh "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
+                 "curl -sf http://localhost:5000/api/health/ready" 2>/dev/null; then
+              echo "Production backend healthy."
+              exit 0
+            fi
+            echo "Attempt $i/12 — waiting 5s..."
+            sleep 5
+          done
+          echo "::error::Production backend health check failed."
+          exit 1
+
+      - name: Sync frontend to production
+        run: |
+          rsync -az --delete \
+            --exclude='.git' --exclude='node_modules' \
+            xconfess-frontend/ \
+            "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:~/xconfess/frontend/"
+
+      - name: Install & restart frontend (production)
+        run: |
+          ssh "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" bash -s <<'REMOTE'
+            set -euo pipefail
+            cd ~/xconfess/frontend
+            npm ci --omit=dev
+            pm2 reload xconfess-frontend --update-env \
+              || pm2 start npm --name xconfess-frontend -- start
+          REMOTE
+
+      - name: Production deploy summary
+        if: always()
+        run: |
+          {
+            echo "## Stage 4 · Production deploy"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Artifact | \`${{ needs.build.outputs.artifact_id }}\` |"
+            echo "| Commit | \`${{ needs.build.outputs.commit_sha }}\` |"
+            echo "| Approved by | @${{ github.actor }} |"
+            echo "| Health check | ${{ steps.prod-health.outcome }} |"
+            echo ""
+            echo "### Rollback"
+            echo "Re-trigger this workflow targeting the previous known-good commit SHA,"
+            echo "or revert the relevant commit on \`main\` and push."
+            echo "Artifacts are retained for ${{ env.ARTIFACT_RETENTION_DAYS }} days (run ID: ${{ github.run_id }})."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+# ── Stage 5: Production smoke test + auto-rollback trigger ───────────────────
+  smoke-production:
+    name: "Stage 5 · Production smoke test"
+    needs: [build, production]
+    runs-on: ubuntu-latest
+    environment: production
+    if: needs.production.result == 'success'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --include=optional --no-audit --no-fund
+
+      - name: Production smoke test
+        id: smoke
+        env:
+          DEPLOYED_URL: ${{ vars.PRODUCTION_URL || secrets.PRODUCTION_URL || '' }}
+        run: node scripts/deployed-smoke.js
+        # Do not continue on error — failure triggers the rollback notice below
+        continue-on-error: true
+
+      - name: Smoke test passed
+        if: steps.smoke.outcome == 'success'
+        run: |
+          echo "✓ Production smoke test passed."
+          {
+            echo "## Stage 5 · Smoke test: PASSED ✓"
+            echo "Artifact \`${{ needs.build.outputs.artifact_id }}\` is confirmed healthy in production."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Smoke test failed — rollback notice
+        if: steps.smoke.outcome == 'failure'
+        run: |
+          echo "::error::Production smoke test FAILED for artifact ${{ needs.build.outputs.artifact_id }}."
+          echo "::error::ROLLBACK REQUIRED: re-run the release pipeline targeting the previous known-good commit."
+          echo "::error::Previous artifacts are retained for ${{ env.ARTIFACT_RETENTION_DAYS }} days."
+          {
+            echo "## Stage 5 · Smoke test: FAILED ✗"
+            echo ""
+            echo "> **Action required**: Production smoke tests failed."
+            echo "> Roll back by re-triggering this workflow against the previous known-good commit SHA,"
+            echo "> or revert on \`main\` and push."
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Failed artifact | \`${{ needs.build.outputs.artifact_id }}\` |"
+            echo "| Run ID | ${{ github.run_id }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1

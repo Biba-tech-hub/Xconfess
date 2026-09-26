@@ -1,0 +1,483 @@
+#!/usr/bin/env node
+/**
+ * scripts/generate-release-notes.js
+ *
+ * Generate a structured release note checklist from:
+ *   - Git commit messages since the last release tag
+ *   - TypeORM migration filenames (schema changes)
+ *   - Contract deployment manifest (Soroban changes)
+ *   - Conventional commit labels (breaking, feat, fix, etc.)
+ *
+ * Usage:
+ *   node scripts/generate-release-notes.js [options]
+ *
+ * Options:
+ *   --from <ref>       Git ref to start from (default: last semver tag or first commit)
+ *   --to <ref>         Git ref to end at (default: HEAD)
+ *   --format <fmt>     Output format: markdown (default) | json | checklist
+ *   --output <file>    Write to file instead of stdout
+ *   --check-unreleased Fail with exit 1 if there are unreleased entries with no tag
+ *
+ * Acceptance criteria (issue #134):
+ *   - Notes identify breaking changes, flags, migrations, rollback constraints,
+ *     and support actions
+ *   - Unreleased entries are detectable (--check-unreleased flag)
+ *
+ * Exit codes:
+ *   0  Success
+ *   1  --check-unreleased: unreleased entries found
+ *   2  Usage error
+ */
+
+'use strict';
+
+const { execSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+
+const REPO_ROOT = path.resolve(__dirname, '..');
+
+// ── Argument parsing ─────────────────────────────────────────────────────────
+function parseArgs(argv = process.argv.slice(2)) {
+  const opts = {
+    from: null,
+    to: 'HEAD',
+    format: 'markdown',
+    output: null,
+    checkUnreleased: false,
+  };
+  for (let i = 0; i < argv.length; i++) {
+    switch (argv[i]) {
+      case '--from':           opts.from = argv[++i]; break;
+      case '--to':             opts.to   = argv[++i]; break;
+      case '--format':         opts.format = argv[++i]; break;
+      case '--output':         opts.output = argv[++i]; break;
+      case '--check-unreleased': opts.checkUnreleased = true; break;
+      case '--help': case '-h':
+        console.log(fs.readFileSync(__filename, 'utf8').split('\n')
+          .filter(l => l.startsWith(' *')).map(l => l.replace(/^ \* ?/, '')).join('\n'));
+        process.exit(0);
+    }
+  }
+  return opts;
+}
+
+// ── Git helpers ──────────────────────────────────────────────────────────────
+function run(cmd, opts = {}) {
+  try {
+    return execSync(cmd, { cwd: REPO_ROOT, encoding: 'utf8', ...opts }).trim();
+  } catch {
+    return '';
+  }
+}
+
+function getLastReleaseTag() {
+  // Find the most recent semver tag (vX.Y.Z or X.Y.Z)
+  const tags = run('git tag --sort=-version:refname').split('\n').filter(Boolean);
+  return tags.find(t => /^v?\d+\.\d+\.\d+/.test(t)) || null;
+}
+
+function getCommitsSince(from, to) {
+  const range = from ? `${from}..${to}` : to;
+  const log = run(`git log ${range} --pretty=format:"%H|%s|%an|%ae|%aI" --no-merges`);
+  if (!log) return [];
+  return log.split('\n').filter(Boolean).map(line => {
+    const [hash, subject, author, email, date] = line.split('|');
+    return { hash: hash?.trim(), subject: subject?.trim(), author: author?.trim(), email: email?.trim(), date: date?.trim() };
+  });
+}
+
+function getUnreleasedCommits() {
+  // Commits on HEAD that have no tag pointing at them
+  const lastTag = getLastReleaseTag();
+  if (!lastTag) return getCommitsSince(null, 'HEAD');
+  const tagCommit = run(`git rev-list -n1 ${lastTag}`);
+  const headCommit = run('git rev-parse HEAD');
+  if (tagCommit === headCommit) return [];
+  return getCommitsSince(lastTag, 'HEAD');
+}
+
+// ── Conventional commit parser ───────────────────────────────────────────────
+function parseConventionalCommit(subject) {
+  // Match: type(scope)!: description  or  type!: description
+  const match = subject.match(/^(\w+)(\([^)]+\))?(!)?\s*:\s*(.+)$/);
+  if (!match) return { type: 'other', scope: null, breaking: false, description: subject };
+  const [, type, scope, bang, description] = match;
+  return {
+    type: type.toLowerCase(),
+    scope: scope ? scope.slice(1, -1) : null,
+    breaking: bang === '!',
+    description,
+  };
+}
+
+function categorizeCommits(commits) {
+  const categories = {
+    breaking: [],
+    feat: [],
+    fix: [],
+    security: [],
+    perf: [],
+    refactor: [],
+    docs: [],
+    chore: [],
+    other: [],
+  };
+
+  for (const commit of commits) {
+    const parsed = parseConventionalCommit(commit.subject);
+    const entry = { ...commit, ...parsed };
+
+    if (parsed.breaking || parsed.type === 'breaking') {
+      categories.breaking.push(entry);
+      continue;
+    }
+    if (parsed.type === 'feat' || parsed.type === 'feature') {
+      categories.feat.push(entry);
+    } else if (parsed.type === 'fix' || parsed.type === 'bugfix') {
+      categories.fix.push(entry);
+    } else if (parsed.type === 'security' || parsed.type === 'sec') {
+      categories.security.push(entry);
+    } else if (parsed.type === 'perf' || parsed.type === 'performance') {
+      categories.perf.push(entry);
+    } else if (parsed.type === 'refactor') {
+      categories.refactor.push(entry);
+    } else if (parsed.type === 'docs') {
+      categories.docs.push(entry);
+    } else if (parsed.type === 'chore' || parsed.type === 'ci' || parsed.type === 'build') {
+      categories.chore.push(entry);
+    } else {
+      categories.other.push(entry);
+    }
+  }
+  return categories;
+}
+
+// ── Migration metadata ───────────────────────────────────────────────────────
+function getMigrationMetadata() {
+  const migrationsDir = path.join(REPO_ROOT, 'xconfess-backend', 'migrations');
+  if (!fs.existsSync(migrationsDir)) return [];
+
+  return fs.readdirSync(migrationsDir)
+    .filter(f => f.endsWith('.ts') && !f.endsWith('.spec.ts'))
+    .sort()
+    .map(filename => {
+      const fullPath = path.join(migrationsDir, filename);
+      const content = fs.readFileSync(fullPath, 'utf8');
+      const hasDown = /async\s+down/.test(content);
+      const hasNotNull = /NOT NULL/.test(content) || /isNullable:\s*false/.test(content);
+      const hasDefault = /DEFAULT\s+/.test(content) || /default:\s*/.test(content);
+      const addedTables = (content.match(/createTable\(['"`]([^'"`]+)['"`]/g) || [])
+        .map(m => m.match(/createTable\(['"`]([^'"`]+)['"`]/)?.[1]).filter(Boolean);
+      const droppedTables = (content.match(/dropTable\(['"`]([^'"`]+)['"`]/g) || [])
+        .map(m => m.match(/dropTable\(['"`]([^'"`]+)['"`]/)?.[1]).filter(Boolean);
+      const addedColumns = (content.match(/addColumn\(['"`]([^'"`]+)['"`]/g) || [])
+        .map(m => m.match(/addColumn\(['"`]([^'"`]+)['"`]/)?.[1]).filter(Boolean);
+
+      return {
+        filename,
+        hasDown,
+        hasNotNull,
+        hasDefault,
+        addedTables,
+        droppedTables,
+        addedColumns,
+        rollbackRisk: hasNotNull && !hasDefault && addedColumns.length > 0,
+        rollbackNote: !hasDown ? 'No down() method — migration is irreversible' : null,
+      };
+    });
+}
+
+// ── Contract metadata ─────────────────────────────────────────────────────────
+function getContractMetadata() {
+  const manifestPath = path.join(REPO_ROOT, 'deployments', 'testnet.json');
+  if (!fs.existsSync(manifestPath)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+// ── Feature flag scan ─────────────────────────────────────────────────────────
+function getFeatureFlags() {
+  // Scan for feature flag references in the codebase
+  const flags = new Set();
+  const searchDirs = [
+    path.join(REPO_ROOT, 'xconfess-backend', 'src'),
+    path.join(REPO_ROOT, 'xconfess-frontend', 'app'),
+  ];
+  function scan(dir) {
+    if (!fs.existsSync(dir)) return;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory() && !['node_modules', 'dist', '.next', '__tests__'].includes(entry.name)) {
+        scan(full);
+      } else if (entry.isFile() && /\.(ts|tsx|js)$/.test(entry.name) && !entry.name.includes('.spec.')) {
+        try {
+          const content = fs.readFileSync(full, 'utf8');
+          // Match feature flag reads: isEnabled('flag-name') or featureFlags.flag_name
+          const matches = [
+            ...content.matchAll(/isEnabled\(['"`]([^'"`]+)['"`]\)/g),
+            ...content.matchAll(/STELLAR_FEATURES_ENABLED/g),
+          ];
+          for (const m of matches) {
+            flags.add(m[1] || 'STELLAR_FEATURES_ENABLED');
+          }
+        } catch { /* ignore unreadable files */ }
+      }
+    }
+  }
+  searchDirs.forEach(scan);
+  return [...flags];
+}
+
+// ── Report generation ─────────────────────────────────────────────────────────
+function generateMarkdown(opts, commits, categories, migrations, contractMeta, featureFlags) {
+  const lines = [];
+  const now = new Date().toISOString().split('T')[0];
+  const lastTag = getLastReleaseTag();
+  const commitCount = commits.length;
+
+  lines.push(`# Release Notes`);
+  lines.push(`\nGenerated: ${now}`);
+  lines.push(`Base ref: ${opts.from || lastTag || '(first commit)'}`);
+  lines.push(`Head ref: ${opts.to}`);
+  lines.push(`Commits: ${commitCount}`);
+  lines.push('');
+
+  // ── Breaking changes ──────────────────────────────────────────────────────
+  lines.push(`## ⚠️ Breaking Changes`);
+  if (categories.breaking.length > 0) {
+    for (const c of categories.breaking) {
+      lines.push(`- **${c.scope ? `${c.scope}: ` : ''}${c.description}** (\`${c.hash?.slice(0,8)}\`)`);
+    }
+    lines.push('');
+    lines.push('> **Support action required:** Notify users and update integration documentation before deployment.');
+  } else {
+    lines.push('_No breaking changes in this range._');
+  }
+  lines.push('');
+
+  // ── Feature flags ─────────────────────────────────────────────────────────
+  lines.push(`## 🚩 Feature Flags`);
+  if (featureFlags.length > 0) {
+    lines.push('The following feature flags are referenced in this codebase:');
+    for (const flag of featureFlags) {
+      lines.push(`- [ ] \`${flag}\` — verify flag state matches deployment intent`);
+    }
+  } else {
+    lines.push('_No feature flags detected._');
+  }
+  lines.push('');
+
+  // ── Schema migrations ─────────────────────────────────────────────────────
+  lines.push(`## 🗄️ Database Migrations`);
+  if (migrations.length > 0) {
+    lines.push(`${migrations.length} migration file(s) in \`xconfess-backend/migrations/\`:`);
+    lines.push('');
+    for (const m of migrations) {
+      const risk = m.rollbackRisk ? ' ⚠️ **rollback risk**' : '';
+      const irreversible = m.rollbackNote ? ` 🔒 ${m.rollbackNote}` : '';
+      lines.push(`- \`${m.filename}\`${risk}${irreversible}`);
+      if (m.addedTables.length) lines.push(`  - Creates tables: ${m.addedTables.join(', ')}`);
+      if (m.droppedTables.length) lines.push(`  - Drops tables: ${m.droppedTables.join(', ')} ⚠️ irreversible data loss`);
+      if (m.addedColumns.length) lines.push(`  - Adds columns on: ${m.addedColumns.join(', ')}`);
+    }
+    lines.push('');
+    lines.push('**Rollback constraints:**');
+    lines.push('- Dropped tables cannot be recreated without a DB restore');
+    lines.push('- NOT NULL columns without DEFAULT prevent rollback to previous app version');
+    lines.push('- Run `npm run backend:migration:show` to verify migration state before deploy');
+  } else {
+    lines.push('_No migrations detected._');
+  }
+  lines.push('');
+
+  // ── Contract changes ──────────────────────────────────────────────────────
+  lines.push(`## ⛓️ Contract Changes`);
+  if (contractMeta) {
+    lines.push(`Network: \`${contractMeta.network || 'testnet'}\``);
+    lines.push(`Deployed at: ${contractMeta.deployedAt || 'unknown'}`);
+    if (contractMeta.contracts) {
+      for (const [name, info] of Object.entries(contractMeta.contracts)) {
+        lines.push(`- \`${name}\`: ${typeof info === 'string' ? info : JSON.stringify(info)}`);
+      }
+    }
+    lines.push('');
+    lines.push('**Rollback constraint:** Soroban contracts are immutable. Rollback = forward-fix upgrade.');
+  } else {
+    lines.push('_No contract deployment manifest found at `deployments/testnet.json`._');
+  }
+  lines.push('');
+
+  // ── Features ──────────────────────────────────────────────────────────────
+  if (categories.feat.length > 0) {
+    lines.push(`## ✨ New Features`);
+    for (const c of categories.feat) {
+      lines.push(`- ${c.scope ? `**${c.scope}:** ` : ''}${c.description} (\`${c.hash?.slice(0,8)}\`)`);
+    }
+    lines.push('');
+  }
+
+  // ── Bug fixes ─────────────────────────────────────────────────────────────
+  if (categories.fix.length > 0) {
+    lines.push(`## 🐛 Bug Fixes`);
+    for (const c of categories.fix) {
+      lines.push(`- ${c.scope ? `**${c.scope}:** ` : ''}${c.description} (\`${c.hash?.slice(0,8)}\`)`);
+    }
+    lines.push('');
+  }
+
+  // ── Security ──────────────────────────────────────────────────────────────
+  if (categories.security.length > 0) {
+    lines.push(`## 🔒 Security`);
+    for (const c of categories.security) {
+      lines.push(`- ${c.description} (\`${c.hash?.slice(0,8)}\`)`);
+    }
+    lines.push('');
+  }
+
+  // ── Release checklist ─────────────────────────────────────────────────────
+  lines.push(`## ✅ Release Checklist`);
+  lines.push('');
+  lines.push('Before shipping:');
+  lines.push('- [ ] `npm run ci` passes (lint, typecheck, build, tests)');
+  lines.push('- [ ] `npm run readiness:test` passes');
+  lines.push('- [ ] `npm run secret-scan` passes');
+  lines.push('- [ ] All breaking changes documented above');
+  lines.push('- [ ] Migration `down()` methods verified for each migration above');
+  lines.push('- [ ] Feature flags set correctly for target environment');
+  lines.push('- [ ] Contract deployment manifest updated if contracts changed');
+  lines.push('- [ ] Support team notified of any user-visible changes');
+  lines.push('- [ ] Rollback procedure confirmed (see `docs/disaster-recovery-runbook.md`)');
+  if (categories.breaking.length > 0) {
+    lines.push('- [ ] **BREAKING**: Customer notification sent before deploy');
+    lines.push('- [ ] **BREAKING**: Integration documentation updated');
+  }
+  lines.push('');
+
+  // ── Unreleased detection ──────────────────────────────────────────────────
+  const unreleased = getUnreleasedCommits();
+  if (unreleased.length > 0 && opts.checkUnreleased) {
+    lines.push(`## 🔖 Unreleased Entries`);
+    lines.push(`${unreleased.length} commit(s) not yet covered by a release tag:`);
+    for (const c of unreleased.slice(0, 10)) {
+      lines.push(`- \`${c.hash?.slice(0,8)}\` ${c.subject}`);
+    }
+    if (unreleased.length > 10) lines.push(`  ...and ${unreleased.length - 10} more`);
+    lines.push('');
+  }
+
+  return lines.join('\n');
+}
+
+function generateJson(opts, commits, categories, migrations, contractMeta, featureFlags) {
+  return JSON.stringify({
+    generated: new Date().toISOString(),
+    from: opts.from,
+    to: opts.to,
+    commitCount: commits.length,
+    breaking: categories.breaking.map(c => ({ hash: c.hash, description: c.description, scope: c.scope })),
+    features: categories.feat.map(c => ({ hash: c.hash, description: c.description, scope: c.scope })),
+    fixes: categories.fix.map(c => ({ hash: c.hash, description: c.description, scope: c.scope })),
+    migrations: migrations.map(m => ({
+      filename: m.filename,
+      rollbackRisk: m.rollbackRisk,
+      rollbackNote: m.rollbackNote,
+      addedTables: m.addedTables,
+      droppedTables: m.droppedTables,
+    })),
+    contracts: contractMeta,
+    featureFlags,
+    hasUnreleased: getUnreleasedCommits().length > 0,
+  }, null, 2);
+}
+
+function generateChecklist(opts, commits, categories, migrations, contractMeta, featureFlags) {
+  const checks = [];
+  const hasBreaking = categories.breaking.length > 0;
+  const hasMigrations = migrations.length > 0;
+  const hasContracts = !!contractMeta;
+  const hasRiskyMigrations = migrations.some(m => m.rollbackRisk);
+  const hasIrreversibleMigrations = migrations.some(m => m.rollbackNote);
+  const hasUnreleased = getUnreleasedCommits().length > 0;
+
+  checks.push(`Release checklist (generated ${new Date().toISOString().split('T')[0]})`);
+  checks.push('');
+  checks.push('[ ] npm run ci passes');
+  checks.push('[ ] npm run readiness:test passes');
+  checks.push('[ ] npm run secret-scan passes');
+  if (hasBreaking) {
+    checks.push('[!] BREAKING CHANGES present — notify customers before deploy');
+    checks.push('[!] Integration docs updated for breaking changes');
+    for (const c of categories.breaking) {
+      checks.push(`    [ ] ${c.description}`);
+    }
+  }
+  if (hasMigrations) {
+    checks.push(`[ ] ${migrations.length} migration(s) reviewed`);
+    if (hasRiskyMigrations) checks.push('[!] Risky NOT NULL migrations — verify backfill or accept rollback constraint');
+    if (hasIrreversibleMigrations) checks.push('[!] Irreversible migrations present — no down() method');
+    checks.push('[ ] npm run backend:migration:show confirms expected state');
+  }
+  if (hasContracts) {
+    checks.push('[ ] Contract manifest reviewed');
+    checks.push('[!] Soroban contracts are irreversible — forward-fix only');
+  }
+  if (featureFlags.length > 0) {
+    checks.push(`[ ] Feature flags verified for target environment: ${featureFlags.join(', ')}`);
+  }
+  if (hasUnreleased) {
+    checks.push('[!] Unreleased commits detected — create a release tag before shipping');
+  }
+  checks.push('[ ] Rollback procedure confirmed (docs/disaster-recovery-runbook.md)');
+  return checks.join('\n');
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+function main() {
+  const opts = parseArgs();
+
+  const lastTag = getLastReleaseTag();
+  if (!opts.from) opts.from = lastTag;
+
+  const commits = getCommitsSince(opts.from, opts.to);
+  const categories = categorizeCommits(commits);
+  const migrations = getMigrationMetadata();
+  const contractMeta = getContractMetadata();
+  const featureFlags = getFeatureFlags();
+
+  let output;
+  switch (opts.format) {
+    case 'json':
+      output = generateJson(opts, commits, categories, migrations, contractMeta, featureFlags);
+      break;
+    case 'checklist':
+      output = generateChecklist(opts, commits, categories, migrations, contractMeta, featureFlags);
+      break;
+    case 'markdown':
+    default:
+      output = generateMarkdown(opts, commits, categories, migrations, contractMeta, featureFlags);
+      break;
+  }
+
+  if (opts.output) {
+    fs.mkdirSync(path.dirname(opts.output), { recursive: true });
+    fs.writeFileSync(opts.output, output, 'utf8');
+    console.error(`Release notes written to: ${opts.output}`);
+  } else {
+    console.log(output);
+  }
+
+  // --check-unreleased: fail if commits exist that aren't tagged
+  if (opts.checkUnreleased) {
+    const unreleased = getUnreleasedCommits();
+    if (unreleased.length > 0) {
+      console.error(`\nFAIL: ${unreleased.length} unreleased commit(s) detected. Create a release tag before shipping.`);
+      process.exit(1);
+    }
+  }
+}
+
+main();

@@ -1,0 +1,84 @@
+name: Performance Regression Triage
+description: Report a benchmark performance regression with reproducible environment metadata and workload links
+title: "[Perf Regression] "
+labels: ["area:performance", "needs:triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template when benchmark runs or load tests detect a performance regression against baseline.
+        Review the [Performance Regression Triage Runbook](docs/PERFORMANCE_REGRESSION_TRIAGE.md) for triage classification guidelines.
+
+  - type: input
+    id: workload
+    attributes:
+      label: Workload / Endpoint
+      description: Which API endpoint or workload showed regression? (e.g. GET /confessions)
+      placeholder: "e.g. GET /confessions"
+    validations:
+      required: true
+
+  - type: input
+    id: commit_sha
+    attributes:
+      label: Commit SHA & Workload Link
+      description: The git commit SHA where the regression was observed.
+      placeholder: "e.g. 478c65b5"
+    validations:
+      required: true
+
+  - type: textarea
+    id: metrics_comparison
+    attributes:
+      label: Baseline vs Measured Metrics
+      description: Provide the observed latency, throughput, error rates, and delta %.
+      placeholder: |
+        - Baseline Avg Latency: 150ms
+        - Measured Avg Latency: 185ms (+23.3% regression)
+        - Throughput: 350 rps (Baseline: 400 rps)
+        - Error Rate: 0%
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment_metadata
+    attributes:
+      label: Environment Metadata
+      description: System hardware and software environment details from benchmark artifact.
+      placeholder: |
+        - OS: Linux 6.6
+        - Node: v22.x
+        - CPU: 4 cores
+        - Memory: 8GB
+    validations:
+      required: true
+
+  - type: dropdown
+    id: classification
+    attributes:
+      label: Regression Classification
+      description: Is this an actionable regression or acceptable noise/jitter?
+      options:
+        - "Actionable Regression (> 10% delta)"
+        - "Noise / Jitter (<= 5% delta)"
+        - "Under Investigation"
+    validations:
+      required: true
+
+  - type: textarea
+    id: baseline_rationale
+    attributes:
+      label: Accepted Baseline Update Rationale (if applicable)
+      description: If updating baseline metrics, state why the change is accepted and necessary.
+      placeholder: "Document why baseline should be updated (minimum 10 characters)..."
+    validations:
+      required: false
+
+  - type: input
+    id: triage_owner
+    attributes:
+      label: Triage Owner
+      description: GitHub handle of the engineer responsible for triage.
+      placeholder: "@username"
+    validations:
+      required: false

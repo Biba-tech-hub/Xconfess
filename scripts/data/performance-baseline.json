@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "lastUpdated": "2026-09-24T00:00:00.000Z",
+  "lastUpdatedCommit": "478c65b5",
+  "lastRationale": "Initial verified production performance baseline",
+  "workloads": {
+    "GET /confessions": {
+      "avgLatencyMs": 150,
+      "p95LatencyMs": 300,
+      "throughputRps": 400,
+      "errorRate": 0
+    },
+    "POST /confessions": {
+      "avgLatencyMs": 180,
+      "p95LatencyMs": 350,
+      "throughputRps": 350,
+      "errorRate": 0
+    },
+    "GET /confessions/:id": {
+      "avgLatencyMs": 90,
+      "p95LatencyMs": 180,
+      "throughputRps": 550,
+      "errorRate": 0
+    },
+    "GET /reactions": {
+      "avgLatencyMs": 110,
+      "p95LatencyMs": 220,
+      "throughputRps": 480,
+      "errorRate": 0
+    },
+    "GET /users/:id/stats": {
+      "avgLatencyMs": 130,
+      "p95LatencyMs": 260,
+      "throughputRps": 420,
+      "errorRate": 0
+    }
+  },
+  "history": [
+    {
+      "updatedAt": "2026-09-24T00:00:00.000Z",
+      "commitSha": "478c65b5",
+      "rationale": "Initial verified production performance baseline"
+    }
+  ]
+}

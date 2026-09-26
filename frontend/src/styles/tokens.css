@@ -1,0 +1,68 @@
+:root {
+  /* Motion tokens */
+  --motion-duration-instant: 0ms;
+  --motion-duration-fast: 120ms;
+  --motion-duration-base: 200ms;
+  --motion-duration-slow: 320ms;
+  --motion-ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --motion-ease-decelerate: cubic-bezier(0, 0, 0, 1);
+  --motion-ease-accelerate: cubic-bezier(0.3, 0, 1, 1);
+
+  /* Status colors (contrast-safe on light surfaces) */
+  --status-success-fg: #0f5132;
+  --status-success-bg: #d1e7dd;
+  --status-warning-fg: #664d03;
+  --status-warning-bg: #fff3cd;
+  --status-danger-fg: #842029;
+  --status-danger-bg: #f8d7da;
+  --status-info-fg: #055160;
+  --status-info-bg: #cff4fc;
+
+  /* Focus ring */
+  --focus-ring-color: #0b5ed7;
+  --focus-ring-width: 2px;
+  --focus-ring-offset: 2px;
+}
+
+/* Reduced motion: snap animations and transitions */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --motion-duration-instant: 0ms;
+    --motion-duration-fast: 0ms;
+    --motion-duration-base: 0ms;
+    --motion-duration-slow: 0ms;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Forced colors / Windows High Contrast */
+@media (forced-colors: active) {
+  :root {
+    --focus-ring-color: Highlight;
+  }
+
+  .status,
+  [data-status] {
+    border: 1px solid currentColor;
+    forced-color-adjust: auto;
+  }
+
+  .status::before,
+  [data-status]::before {
+    content: attr(data-status-label);
+    margin-inline-end: 0.25em;
+  }
+
+  :focus-visible {
+    outline: var(--focus-ring-width) solid var(--focus-ring-color);
+    outline-offset: var(--focus-ring-offset);
+  }
+}

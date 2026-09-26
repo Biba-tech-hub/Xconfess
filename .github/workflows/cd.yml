@@ -108,6 +108,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # Run migration gate before building (issue #129).
+      # Unsafe or malformed migrations block artifact creation.
+      - name: Migration gate
+        run: node scripts/migration-gate.js
+
       - name: Build backend
         run: npm run build --workspace=xconfess-backend
 
@@ -198,6 +203,14 @@ jobs:
             cd ~/xconfess/backend
             cp .env.deploy .env
             npm ci --omit=dev
+            # Run database migrations before starting the new app version (issue #129).
+            # This ensures the schema is updated before any new code that depends on it
+            # starts serving traffic (expand phase of expand/contract).
+            echo "Running database migrations..."
+            npm run migration:run 2>&1 || {
+              echo "::error::Database migrations failed. Aborting deploy to prevent schema/code mismatch."
+              exit 1
+            }
             if command -v pm2 &>/dev/null; then
               pm2 reload xconfess-backend --update-env || pm2 start dist/main.js --name xconfess-backend
             else
@@ -260,4 +273,77 @@ jobs:
             echo "### Rollback"
             echo "Re-run this workflow against the previous commit SHA to roll back, or SSH to the host and restore the previous \`dist/\` and \`.next/\` directories."
             echo "Backend artifacts are retained for 7 days under Actions run IDs."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  post-deploy-verify:
+    name: Post-deploy verification
+    needs: [prepare, deploy]
+    if: needs.deploy.result == 'success'
+    runs-on: ubuntu-latest
+    environment: ${{ needs.prepare.outputs.environment }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Secret scan build artifacts
+        # Scans the diff introduced by this deployment for accidental secrets.
+        # Exits 1 if unallowlisted secrets are found, blocking post-deploy evidence.
+        run: npm run secret-scan:diff
+
+      - name: Run post-deploy verification
+        # Proves critical paths work on the live environment after promotion.
+        # Failures are evidence of a broken deploy and should trigger rollback.
+        env:
+          BACKEND_URL: ${{ secrets.BACKEND_API_URL }}
+        run: |
+          node scripts/post-deploy-verify.js \
+            --env "${{ needs.prepare.outputs.environment }}" \
+            --commit "${{ github.sha }}" \
+            --run-id "${{ github.run_id }}" \
+            --evidence-dir post-deploy-evidence \
+            --skip-auth
+
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: post-deploy-evidence-${{ github.run_id }}
+          path: post-deploy-evidence/
+          retention-days: 90
+
+      - name: Generate release notes
+        # Produces a structured checklist of changes in this release.
+        run: |
+          node scripts/generate-release-notes.js \
+            --format markdown \
+            --output post-deploy-evidence/release-notes.md
+        continue-on-error: true
+
+      - name: Append post-deploy summary
+        if: always()
+        run: |
+          {
+            echo "## Post-Deploy Verification"
+            echo ""
+            echo "| Check | Result |"
+            echo "|-------|--------|"
+            echo "| Secret scan (diff) | Passed or see above |"
+            echo "| Critical path verification | See uploaded evidence artifact |"
+            echo ""
+            echo "Evidence retained for 90 days under:"
+            echo "\`post-deploy-evidence-${{ github.run_id }}\`"
+            echo ""
+            echo "If verification failed, follow the rollback procedure in"
+            echo "[docs/disaster-recovery-runbook.md](docs/disaster-recovery-runbook.md)."
           } >> "$GITHUB_STEP_SUMMARY"

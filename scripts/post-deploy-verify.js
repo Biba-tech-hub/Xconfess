@@ -1,0 +1,468 @@
+#!/usr/bin/env node
+/**
+ * scripts/post-deploy-verify.js
+ *
+ * Post-deployment verification and evidence retention for xConfess.
+ *
+ * Runs authenticated and anonymous smoke checks, contract health probes,
+ * health endpoint assertions, and captures evidence tied to the release
+ * identity (commit SHA, run ID, environment).  Evidence is retained to a
+ * local directory (and optionally uploaded as a CI artifact).
+ *
+ * A green deployment job is NOT sufficient — this script proves the live
+ * critical paths work after promotion.
+ *
+ * Usage:
+ *   node scripts/post-deploy-verify.js [options]
+ *
+ * Options:
+ *   --backend-url <url>    Backend base URL (default: BACKEND_URL env or https://...)
+ *   --frontend-url <url>   Frontend base URL (default: FRONTEND_URL env or https://...)
+ *   --env <name>           Environment name for evidence label (default: staging)
+ *   --commit <sha>         Commit SHA for evidence label (default: GITHUB_SHA or git rev-parse)
+ *   --run-id <id>          CI run ID for evidence label (default: GITHUB_RUN_ID or timestamp)
+ *   --evidence-dir <dir>   Directory to write evidence (default: post-deploy-evidence)
+ *   --timeout-ms <n>       Per-request timeout in ms (default: 45000)
+ *   --retries <n>          Max attempts per check (default: 5)
+ *   --retry-delay-ms <n>   Delay between retries (default: 5000)
+ *   --fail-policy <policy> What to do on failure: halt (default) | warn
+ *   --skip-auth            Skip authenticated checks (no credentials available)
+ *
+ * Environment variables:
+ *   BACKEND_URL            Backend base URL
+ *   FRONTEND_URL           Frontend base URL
+ *   SMOKE_TEST_EMAIL       Email for authenticated check (no default — skipped if missing)
+ *   SMOKE_TEST_PASSWORD    Password for authenticated check
+ *   GITHUB_SHA             Commit SHA (set by GitHub Actions)
+ *   GITHUB_RUN_ID          Run ID (set by GitHub Actions)
+ *   GITHUB_ACTOR           Deployer identity (set by GitHub Actions)
+ *
+ * Exit codes:
+ *   0  All critical checks passed; evidence retained
+ *   1  One or more critical checks failed (halt policy)
+ *
+ * Acceptance criteria (issue #135):
+ *   - Covers critical paths without exposing user data
+ *   - Failures halt or roll back per policy
+ *   - Evidence is retained with release identity
+ */
+
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+// ── Parse args ────────────────────────────────────────────────────────────────
+function parseArgs(argv = process.argv.slice(2)) {
+  const opts = {
+    backendUrl: process.env.BACKEND_URL || 'https://xconfess-backend.onrender.com',
+    frontendUrl: process.env.FRONTEND_URL || 'https://xconfess.vercel.app',
+    env: 'staging',
+    commit: process.env.GITHUB_SHA || '',
+    runId: process.env.GITHUB_RUN_ID || `local-${Date.now()}`,
+    evidenceDir: 'post-deploy-evidence',
+    timeoutMs: 45000,
+    retries: 5,
+    retryDelayMs: 5000,
+    failPolicy: 'halt',
+    skipAuth: false,
+    testEmail: process.env.SMOKE_TEST_EMAIL || '',
+    testPassword: process.env.SMOKE_TEST_PASSWORD || '',
+  };
+  for (let i = 0; i < argv.length; i++) {
+    switch (argv[i]) {
+      case '--backend-url':   opts.backendUrl   = argv[++i]; break;
+      case '--frontend-url':  opts.frontendUrl  = argv[++i]; break;
+      case '--env':           opts.env          = argv[++i]; break;
+      case '--commit':        opts.commit       = argv[++i]; break;
+      case '--run-id':        opts.runId        = argv[++i]; break;
+      case '--evidence-dir':  opts.evidenceDir  = argv[++i]; break;
+      case '--timeout-ms':    opts.timeoutMs    = Number(argv[++i]); break;
+      case '--retries':       opts.retries      = Number(argv[++i]); break;
+      case '--retry-delay-ms': opts.retryDelayMs = Number(argv[++i]); break;
+      case '--fail-policy':   opts.failPolicy   = argv[++i]; break;
+      case '--skip-auth':     opts.skipAuth     = true; break;
+    }
+  }
+  // Resolve commit if not set
+  if (!opts.commit) {
+    try {
+      const { execSync } = require('child_process');
+      opts.commit = execSync('git rev-parse HEAD', { encoding: 'utf8' }).trim();
+    } catch { opts.commit = 'unknown'; }
+  }
+  return opts;
+}
+
+// ── Request utilities ─────────────────────────────────────────────────────────
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function joinUrl(base, p) {
+  return `${base.replace(/\/+$/, '')}${p}`;
+}
+
+function isRetryable(err) {
+  return err && (err.name === 'AbortError' || err.name === 'TypeError');
+}
+
+function isRenderWake(res) {
+  return res.headers?.get?.('x-render-routing') === 'hibernate-wake-error';
+}
+
+async function request(label, url, reqOpts, expectedStatuses, opts) {
+  const { timeoutMs, retries, retryDelayMs } = opts;
+  let lastError;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    const controller = new AbortController();
+    const tid = setTimeout(() => controller.abort(), timeoutMs);
+    const started = Date.now();
+    let res;
+    try {
+      res = await fetch(url, {
+        ...reqOpts,
+        signal: controller.signal,
+        headers: {
+          accept: 'application/json',
+          ...(reqOpts.body ? { 'content-type': 'application/json' } : {}),
+          ...(reqOpts.headers || {}),
+        },
+      });
+    } catch (err) {
+      clearTimeout(tid);
+      const latency = Date.now() - started;
+      lastError = err;
+      const reason = err.name === 'AbortError' ? `timeout after ${timeoutMs}ms` : err.message;
+      if (attempt < retries && isRetryable(err)) {
+        console.log(`  [retry ${attempt}/${retries}] ${label}: ${reason}`);
+        await sleep(retryDelayMs * attempt);
+        continue;
+      }
+      throw new Error(`${label} failed (${latency}ms): ${reason}`);
+    }
+    clearTimeout(tid);
+    const latency = Date.now() - started;
+    if (!expectedStatuses.includes(res.status)) {
+      if (attempt < retries && (res.status === 503 && isRenderWake(res))) {
+        console.log(`  [retry ${attempt}/${retries}] ${label}: Render hibernate wake`);
+        await sleep(retryDelayMs * attempt);
+        continue;
+      }
+      const body = await res.text().catch(() => '');
+      throw new Error(`${label} returned ${res.status} (${latency}ms): ${body.slice(0, 300)}`);
+    }
+    console.log(`  ✓ ${label}: ${res.status} (${latency}ms)`);
+    return res;
+  }
+  throw lastError || new Error(`${label} exhausted retries`);
+}
+
+async function requestJson(label, url, reqOpts, expectedStatuses, opts) {
+  const res = await request(label, url, reqOpts, expectedStatuses, opts);
+  return res.json();
+}
+
+// ── Privacy guards ────────────────────────────────────────────────────────────
+const SENSITIVE_KEYS = new Set([
+  'authorization', 'body', 'content', 'email', 'ip', 'ipaddress', 'jwt',
+  'message', 'password', 'passwordhash', 'phone', 'privatekey', 'rawip',
+  'seed', 'seedphrase', 'sessiontoken', 'token', 'useragent',
+]);
+
+function assertNoSensitiveData(label, obj, path = '') {
+  if (!obj || typeof obj !== 'object') return;
+  for (const [key, value] of Object.entries(obj)) {
+    const norm = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const fullPath = path ? `${path}.${key}` : key;
+    if (SENSITIVE_KEYS.has(norm) || norm.endsWith('token') || norm.includes('privatekey')) {
+      throw new Error(`${label} exposed sensitive field: ${fullPath}`);
+    }
+    assertNoSensitiveData(label, value, fullPath);
+  }
+}
+
+// ── Evidence capture ──────────────────────────────────────────────────────────
+function buildEvidenceRecord(opts) {
+  return {
+    releaseIdentity: {
+      environment: opts.env,
+      commitSha: opts.commit,
+      runId: opts.runId,
+      deployedBy: process.env.GITHUB_ACTOR || 'local',
+      verifiedAt: new Date().toISOString(),
+    },
+    checks: [],
+    summary: { passed: 0, failed: 0, skipped: 0 },
+  };
+}
+
+function recordCheck(evidence, name, status, details = {}) {
+  const record = {
+    name,
+    status,  // 'pass' | 'fail' | 'skip'
+    timestamp: new Date().toISOString(),
+    ...details,
+  };
+  evidence.checks.push(record);
+  if (status === 'pass')  evidence.summary.passed++;
+  if (status === 'fail')  evidence.summary.failed++;
+  if (status === 'skip')  evidence.summary.skipped++;
+  return record;
+}
+
+function writeEvidence(evidence, opts) {
+  const dir = opts.evidenceDir;
+  fs.mkdirSync(dir, { recursive: true });
+  const filename = `verify-${opts.env}-${opts.commit.slice(0, 8)}-${opts.runId}.json`;
+  const filepath = path.join(dir, filename);
+  // Redact any accidental credential fields before writing
+  const safe = JSON.stringify(evidence, (key, value) => {
+    const norm = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (SENSITIVE_KEYS.has(norm)) return '[REDACTED]';
+    return value;
+  }, 2);
+  fs.writeFileSync(filepath, safe, 'utf8');
+  console.log(`\nEvidence retained: ${filepath}`);
+  return filepath;
+}
+
+// ── Checks ────────────────────────────────────────────────────────────────────
+async function checkBackendLiveness(evidence, opts) {
+  console.log('\n── Backend health checks');
+  try {
+    const live = await requestJson('backend /health/live', joinUrl(opts.backendUrl, '/api/health/live'), {}, [200], opts);
+    assertNoSensitiveData('health/live', live);
+    recordCheck(evidence, 'backend-liveness', 'pass', { url: joinUrl(opts.backendUrl, '/api/health/live') });
+  } catch (err) {
+    recordCheck(evidence, 'backend-liveness', 'fail', { error: err.message });
+    throw err;
+  }
+}
+
+async function checkBackendReadiness(evidence, opts) {
+  try {
+    const ready = await requestJson('backend /health/ready', joinUrl(opts.backendUrl, '/api/health/ready'), {}, [200], opts);
+    assertNoSensitiveData('health/ready', ready);
+    recordCheck(evidence, 'backend-readiness', 'pass', { url: joinUrl(opts.backendUrl, '/api/health/ready') });
+  } catch (err) {
+    recordCheck(evidence, 'backend-readiness', 'fail', { error: err.message });
+    throw err;
+  }
+}
+
+async function checkBackendStatus(evidence, opts) {
+  try {
+    const status = await requestJson('backend /health/status', joinUrl(opts.backendUrl, '/api/health/status'), {}, [200, 503], opts);
+    assertNoSensitiveData('health/status', status);
+    recordCheck(evidence, 'backend-status', 'pass', {
+      url: joinUrl(opts.backendUrl, '/api/health/status'),
+      statusCode: 'captured',
+    });
+  } catch (err) {
+    recordCheck(evidence, 'backend-status', 'fail', { error: err.message });
+    // Status is informational — not a hard failure
+    console.log(`  ⚠ backend-status: ${err.message} (non-fatal)`);
+  }
+}
+
+async function checkPublicTraction(evidence, opts) {
+  console.log('\n── Public API checks');
+  try {
+    const traction = await requestJson('public /api/public/traction', joinUrl(opts.backendUrl, '/api/public/traction'), {}, [200], opts);
+    assertNoSensitiveData('public traction', traction);
+    if (!traction.users || !traction.engagement || !traction.stellar || !traction.reliability) {
+      throw new Error('public traction API missing required aggregate sections');
+    }
+    recordCheck(evidence, 'public-traction-api', 'pass');
+  } catch (err) {
+    recordCheck(evidence, 'public-traction-api', 'fail', { error: err.message });
+    throw err;
+  }
+}
+
+async function checkStellarConfig(evidence, opts) {
+  try {
+    const cfg = await requestJson('public /api/stellar/config', joinUrl(opts.backendUrl, '/api/stellar/config'), {}, [200], opts);
+    assertNoSensitiveData('stellar config', cfg);
+    if (!cfg.network || !cfg.contractIds) {
+      throw new Error('stellar config missing network or contractIds');
+    }
+    recordCheck(evidence, 'stellar-config', 'pass', { network: cfg.network });
+  } catch (err) {
+    recordCheck(evidence, 'stellar-config', 'fail', { error: err.message });
+    // Stellar config failure is non-fatal when STELLAR_FEATURES_ENABLED=false
+    console.log(`  ⚠ stellar-config: ${err.message} (non-fatal when STELLAR_FEATURES_ENABLED=false)`);
+  }
+}
+
+async function checkFrontendCriticalPaths(evidence, opts) {
+  console.log('\n── Frontend critical path checks');
+  const paths = [
+    { path: '/traction',           label: 'frontend-traction-page',    expected: [200] },
+    { path: '/api/auth/session',   label: 'frontend-anon-session',     expected: [401] },
+    { path: '/api/users/register', label: 'frontend-register-guard',   expected: [405] },
+  ];
+  for (const { path: p, label, expected } of paths) {
+    try {
+      await request(label, joinUrl(opts.frontendUrl, p), {}, expected, opts);
+      recordCheck(evidence, label, 'pass');
+    } catch (err) {
+      recordCheck(evidence, label, 'fail', { error: err.message });
+      throw err;
+    }
+  }
+}
+
+async function checkAuthenticatedPaths(evidence, opts) {
+  if (opts.skipAuth || !opts.testEmail || !opts.testPassword) {
+    console.log('\n── Authenticated checks (skipped — no credentials)');
+    recordCheck(evidence, 'authenticated-login', 'skip', {
+      reason: opts.skipAuth ? '--skip-auth flag set' : 'SMOKE_TEST_EMAIL/PASSWORD not set',
+    });
+    return;
+  }
+  console.log('\n── Authenticated checks');
+
+  let sessionCookie = '';
+  // Login
+  try {
+    const res = await request(
+      'auth login',
+      joinUrl(opts.backendUrl, '/api/auth/login'),
+      {
+        method: 'POST',
+        body: JSON.stringify({ email: opts.testEmail, password: opts.testPassword }),
+        credentials: 'include',
+      },
+      [200, 201],
+      opts
+    );
+    const setCookie = res.headers.get('set-cookie') || '';
+    // Extract cookie name without printing the value
+    const cookieName = setCookie.split('=')[0];
+    if (cookieName) sessionCookie = setCookie;
+    recordCheck(evidence, 'authenticated-login', 'pass');
+  } catch (err) {
+    recordCheck(evidence, 'authenticated-login', 'fail', { error: err.message });
+    throw err;
+  }
+
+  // Fetch own profile (authenticated)
+  if (sessionCookie) {
+    try {
+      const profile = await requestJson(
+        'auth /api/users/me',
+        joinUrl(opts.backendUrl, '/api/users/me'),
+        { headers: { Cookie: sessionCookie } },
+        [200],
+        opts
+      );
+      // Profile may include email — redact before evidence
+      assertNoSensitiveData('profile', profile);
+      recordCheck(evidence, 'authenticated-profile', 'pass');
+    } catch (err) {
+      // Profile may contain sensitive data — record error only
+      recordCheck(evidence, 'authenticated-profile', 'fail', { error: err.message });
+      console.log(`  ⚠ authenticated-profile: ${err.message} (non-fatal)`);
+    }
+  }
+}
+
+async function checkContractHealth(evidence, opts) {
+  console.log('\n── Contract / Stellar checks');
+  // These are informational — Stellar features may be disabled
+  try {
+    const cfg = await requestJson(
+      'stellar diagnostics',
+      joinUrl(opts.backendUrl, '/api/stellar/diagnostics'),
+      {},
+      [200, 403, 404],
+      opts
+    );
+    assertNoSensitiveData('stellar diagnostics', cfg || {});
+    recordCheck(evidence, 'stellar-diagnostics', 'pass');
+  } catch (err) {
+    recordCheck(evidence, 'stellar-diagnostics', 'skip', { reason: err.message });
+    console.log(`  ℹ stellar-diagnostics: ${err.message} (skipped)`);
+  }
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+async function main() {
+  const opts = parseArgs();
+  const evidence = buildEvidenceRecord(opts);
+
+  console.log('xConfess Post-Deploy Verification');
+  console.log('==================================');
+  console.log(`Environment:   ${opts.env}`);
+  console.log(`Commit:        ${opts.commit}`);
+  console.log(`Run ID:        ${opts.runId}`);
+  console.log(`Backend URL:   ${opts.backendUrl}`);
+  console.log(`Frontend URL:  ${opts.frontendUrl}`);
+  console.log(`Evidence dir:  ${opts.evidenceDir}`);
+  console.log('');
+
+  const criticalChecks = [
+    () => checkBackendLiveness(evidence, opts),
+    () => checkBackendReadiness(evidence, opts),
+    () => checkPublicTraction(evidence, opts),
+    () => checkFrontendCriticalPaths(evidence, opts),
+  ];
+  const softChecks = [
+    () => checkBackendStatus(evidence, opts),
+    () => checkStellarConfig(evidence, opts),
+    () => checkAuthenticatedPaths(evidence, opts),
+    () => checkContractHealth(evidence, opts),
+  ];
+
+  let criticalFailed = false;
+
+  // Run critical checks — any failure halts (if fail-policy=halt)
+  for (const check of criticalChecks) {
+    try {
+      await check();
+    } catch (err) {
+      criticalFailed = true;
+      if (opts.failPolicy === 'halt') {
+        console.error(`\n✗ Critical check failed: ${err.message}`);
+        console.error('Halting post-deploy verification (--fail-policy=halt).');
+        console.error('Initiate rollback per docs/disaster-recovery-runbook.md');
+        writeEvidence(evidence, opts);
+        process.exit(1);
+      }
+    }
+  }
+
+  // Run soft checks — failures are recorded but do not halt
+  for (const check of softChecks) {
+    try {
+      await check();
+    } catch { /* already recorded in evidence */ }
+  }
+
+  // Write evidence
+  const evidencePath = writeEvidence(evidence, opts);
+
+  // Summary
+  console.log('\n── Verification Summary');
+  console.log(`Passed:  ${evidence.summary.passed}`);
+  console.log(`Failed:  ${evidence.summary.failed}`);
+  console.log(`Skipped: ${evidence.summary.skipped}`);
+  console.log(`Evidence: ${evidencePath}`);
+  console.log('');
+
+  if (criticalFailed) {
+    console.error('✗ One or more critical checks failed.');
+    process.exit(1);
+  }
+
+  console.log('✓ Post-deploy verification passed.');
+  process.exit(0);
+}
+
+main().catch(err => {
+  console.error('Unexpected error:', err.message || err);
+  process.exit(1);
+});

@@ -1,273 +1,92 @@
-# Contributing to Xconfess
-
-Thank you for your interest in contributing to Xconfess - an anonymous confession platform built on the Stellar blockchain. This guide covers everything you need to get started.
-
----
-
-## Table of Contents.
-
-- [Prerequisites](#prerequisites)
-- [Environment Setup](#environment-setup)
-- [Development Workflow](#development-workflow)
-- [Code Style](#code-style)
-- [Testing Requirements](#testing-requirements)
-- [Validation Command Matrix](#validation-command-matrix)
-- [Pull Request Process](#pull-request-process)
-- [Wave / Drips Contribution Guidelines](#wave--drips-contribution-guidelines)
-
----
-.
-## Prerequisites
-
-Make sure you have the following installed before cloning:
-
-| Tool | Minimum Version | Purpose |
-|------|----------------|---------|
-| Node.js | 18.0.0+ | Backend + Frontend |
-| npm | 9.0.0+ | Package manager |
-| Rust | stable (latest) | Smart contracts |
-| Docker + Docker Compose | 24.0+ | PostgreSQL + Redis |
-| Git | any recent | Version control |
-
-### Install Rust (if not installed)
-
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-    rustup target add wasm32-unknown-unknown
-
-### Install Stellar CLI
-
-    cargo install --locked stellar-cli
-
----
-
-## Environment Setup
-
-### 1. Clone the repository
-
-    git clone https://github.com/Xconfess/Xconfess.git
-    cd Xconfess
-
-### 2. Install dependencies
-
-    npm install
-
-This installs dependencies for all three workspaces:
-- xconfess-backend - NestJS API
-- xconfess-frontend - React frontend
-- xconfess-contracts - Soroban smart contracts
-
-### 3. Set up environment variables
-
-    cp xconfess-backend/.env.example xconfess-backend/.env
-
-Open xconfess-backend/.env and fill in the required values. At minimum:
-
-    DATABASE_URL=postgresql://postgres:postgres@localhost:55432/xconfess
-    REDIS_URL=redis://localhost:6379
-
-### 4. Start Docker services (PostgreSQL + Redis)
-
-    docker compose up -d
-
-Verify both services are healthy:
-
-    docker compose ps
-
-Both xconfess-postgres and xconfess-redis should show healthy.
-
-### 5. Start the development server
-
-    # Run backend + frontend together
-    npm run dev
-
-    # Or run separately
-    npm run dev:backend
-    npm run dev:frontend
-
----
-
-## Development Workflow
-
-### Picking an OSS issue
-
-If you are contributing through an OSS campaign or grant program:
-
-- Start with issues labeled `good first issue`, `help wanted`, `Stellar Wave`, `Maybe Rewarded`, or `Official Campaign`.
-- Comment on the issue before starting so maintainers can confirm it is still available.
-- Keep the PR focused on one issue. Do not bundle unrelated cleanup.
-- Follow the acceptance criteria and validation commands listed in the issue.
-- Ask for clarification in the issue thread instead of guessing when scope is unclear.
-
-Recommended first picks:
-
-| Area | Good starter work |
-|------|-------------------|
-| Docs | Setup guides, troubleshooting, diagrams, screenshots |
-| Frontend | Empty states, auth polish, proxy route tests, mobile fixes |
-| Backend | DTO validation, error handling, health checks, focused tests |
-| Stellar | Contract metadata checks, docs, testnet smoke scripts |
-| Ops | CI checks, deployment preflight, env validation |
-
-### Branch Naming
-
-Always branch off main. Use this naming convention:
-
-| Type | Pattern | Example |
-|------|---------|---------|
-| Feature | feat/short-description | feat/gdpr-export |
-| Bug fix | fix/short-description | fix/token-expiry |
-| Tests | test/short-description | test/audit-events |
-| Docs | docs/short-description | docs/contributing |
-| Refactor | refactor/short-description | refactor/auth-module |
-
-    git checkout main
-    git pull origin main
-    git checkout -b feat/your-feature-name
-
-### Commit Messages
-
-Follow the Conventional Commits format:
-
-    <type>(<scope>): <short summary>
-    [optional body]
-    [optional footer]
-
-Types: feat, fix, test, docs, refactor, chore, perf
-
-Examples:
-
-    feat(backend): add GDPR data export endpoint
-    fix(contracts): correct token expiry calculation
-    test(backend): add audit event unit tests
-    docs: add CONTRIBUTING.md
-
-Rules:
-- Summary line under 72 characters
-- Use present tense (add not added)
-- Reference issues in footer: Closes #123
-
-### PR Size Policy
-
-- Ideal: under 400 lines changed
-- Maximum: 800 lines changed
-- If your change is larger, split it into multiple PRs
-
----
-
-## Code Style
-
-### Backend (TypeScript / NestJS)
-
-    npm run backend:lint
-
-Prettier config (xconfess-backend/.prettierrc): single quotes, trailing commas, 2-space indentation.
-
-### Frontend (TypeScript / React)
-
-    npm run frontend:lint
-
-### Smart Contracts (Rust / Soroban)
-
-    npm run contract:fmt
-    npm run contract:fmt:check
-    npm run contract:lint
-
-All Rust code must pass rustfmt and clippy before submission.
-
----
-
-## Testing Requirements
-
-| Area | Command | Required |
-|------|---------|----------|
-| Backend unit tests | npm run backend:test | Yes |
-| Contract tests | npm run contract:test | Yes |
-| Frontend tests | npm run frontend:test | Yes |
-| Backend E2E tests | npm run backend:test:e2e | Optional |
-| Contract integration | npm run contract:test:integration | Optional |
-| Frontend smoke tests | npm run frontend:test:smoke | Optional |
-
-Run all required tests at once:
-
-    npm run test
-
-Run the full CI check locally before opening a PR:
-
-    npm run ci
-
-All CI checks must pass before a PR will be reviewed.
-
----
-
-## Validation Command Matrix
-
-Not sure which commands to run for your change? Refer to the **[Validation Command Matrix](docs/VALIDATION_COMMAND_MATRIX.md)** for a complete table mapping each change area (docs, frontend component, frontend route, backend service, migration, Stellar contract, ops script) to the exact copy-pasteable commands required.
-
----
-
-## Pull Request Process
-
-### Before opening a PR
-
-- Branch is up to date with main
-- npm run ci passes locally
-- New code has corresponding unit tests
-- No console.log or debug statements left in
-- Environment variables are documented in .env.example if added
-
-### PR Title
-
-Use Conventional Commits format: feat(backend): add GDPR data export endpoint
-
-### PR Description Template
-
-    ## Summary
-    Brief description of what this PR does.
-
-    ## Changes
-    - List of specific changes made
-
-    ## Testing
-    - How was this tested?
-    - Which test commands were run?
-
-    ## Related Issues
-    Closes #<issue-number>
-
-### Auto-merge Criteria
-
-- All CI checks pass
-- At least 1 approving review from a maintainer
-- No unresolved review comments
-- PR is not marked as Draft
-
----
-
-## Wave / Drips Contribution Guidelines
-
-Xconfess participates in multiple OSS programs, including Stellar Wave. If your contribution is tied to a program issue:
-
-- Reference the issue number in your PR description
-- Keep each program contribution as a single focused PR - one issue, one PR
-- Do not bundle multiple program issues into one PR
-- Ensure your implementation matches the acceptance criteria listed in the issue exactly
-- Add or update tests that validate the acceptance criteria
-
-### Contribution checklist for program PRs
-
-- Branch named after the feature area
-- PR title references the feature area
-- All acceptance criteria from the issue are met
-- Tests cover the new behaviour
-- No unrelated changes are bundled in
-- npm run ci passes
-
----
-
-## Getting Help
-
-- Open a GitHub Discussion
-- Comment on the relevant issue
-- Check existing PRs for examples of similar contributions
-
-We appreciate every contribution, no matter how small. Thank you for helping build Xconfess!
+# Contributing
+
+Thanks for your interest in contributing! This document covers the basics of
+setting up the project, running checks, and the quality gates your change must
+pass before it can be merged.
+
+## Getting started
+
+1. Fork and clone the repository.
+2. Install dependencies with `npm install`.
+3. Create a topic branch off `main`.
+4. Make your change, add tests, and run the checks below.
+
+## Quality gates
+
+Every pull request must pass the following gates. CI runs them automatically and
+will fail the build when a deterministic check regresses.
+
+```bash
+npm run frontend:lint
+npm run frontend:test
+npm run frontend:test:e2e
+```
+
+## Accessibility acceptance gates (WCAG 2.2 AA)
+
+Accessibility is a release-level requirement, not an afterthought. Critical
+routes and shared components must meet the **WCAG 2.2 Level AA** conformance
+target before a release ships. Automated checks catch deterministic regressions
+in CI; manual checks cover behavior that tooling cannot verify.
+
+### Conformance target
+
+- **Standard:** WCAG 2.2 Level AA.
+- **Scope:** all critical routes and the shared components they render.
+- **Release gate:** a release is blocked if any critical route fails an AA gate
+  below, or if a deterministic automated check regresses.
+
+### Route / component matrix
+
+Each critical route and shared component is evaluated against the dimensions
+below. When you add or change a critical route or shared component, update this
+matrix and the corresponding automated coverage.
+
+| Route / component | Keyboard | Focus | Semantics | Contrast | Motion | Assistive tech |
+| --- | --- | --- | --- | --- | --- | --- |
+| App shell / navigation | Tab order reaches all controls; no traps | Visible focus indicator; focus returns after overlays close | Landmarks (`header`/`nav`/`main`), one `h1` per view | Text and UI ≥ 4.5:1 / 3:1 | Honors `prefers-reduced-motion` | Screen reader announces landmarks and current page |
+| Composer / input | Fully operable via keyboard; shortcuts documented | Focus moves to input on open; restored on close | Labeled controls, `aria-*` state exposed | Placeholder and helper text ≥ 4.5:1 | No motion required to operate | Errors and status announced via live region |
+| Lists / feeds | Items reachable and activatable by keyboard | Focus visible on the active item; roving tabindex where applicable | List semantics (`ul`/`li` or `role="list"`) | Item text and metadata ≥ 4.5:1 | Animated inserts respect reduced motion | Item count and updates announced |
+| Modals / dialogs | Escape closes; focus trapped while open | Initial focus set; focus restored to trigger | `role="dialog"`, `aria-modal`, labeled by title | Overlay content ≥ 4.5:1 | Open/close animation respects reduced motion | Title and description announced on open |
+| Forms / settings | All fields and actions keyboard operable | Focus order matches visual order | Every input has a programmatic label | Labels, hints, and errors ≥ 4.5:1 | No motion-only feedback | Validation errors linked via `aria-describedby` |
+
+### Automated checks
+
+- Linting includes accessibility rules for JSX/TSX.
+- Component tests assert roles, accessible names, and keyboard interactions for
+  the shared components above.
+- End-to-end tests exercise keyboard-only flows and assert focus management for
+  critical routes.
+- Deterministic accessibility regressions fail CI via the gates in
+  `npm run frontend:lint`, `npm run frontend:test`, and
+  `npm run frontend:test:e2e`.
+
+### Manual checks
+
+Automated tooling cannot cover everything. Before requesting review on a change
+that touches a critical route or shared component, verify manually:
+
+- **Keyboard:** complete the primary task using only the keyboard; confirm no
+  focus traps and a logical tab order.
+- **Focus:** confirm a visible focus indicator and that focus is restored after
+  dialogs, menus, and overlays close.
+- **Semantics:** confirm landmarks, headings, and roles match the matrix.
+- **Contrast:** confirm text and meaningful UI meet 4.5:1 / 3:1 using a contrast
+  checker.
+- **Motion:** enable `prefers-reduced-motion` and confirm animations are reduced
+  or removed.
+- **Assistive tech:** run the primary flow with a screen reader (e.g. VoiceOver,
+  NVDA) and confirm names, states, and live updates are announced.
+
+Document any manual checks performed in the pull request description, along with
+assumptions and follow-up work.
+
+## Pull request checklist
+
+- [ ] Change is focused on the stated scope.
+- [ ] `npm run frontend:lint`, `npm run frontend:test`, and
+      `npm run frontend:test:e2e` pass locally.
+- [ ] Accessibility matrix updated for any new or changed critical route or
+      shared component.
+- [ ] Manual accessibility checks performed and noted in the description.
+- [ ] Adjacent contracts or runbooks updated when behavior changes.

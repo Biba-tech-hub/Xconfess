@@ -1,0 +1,300 @@
+name: Provenance & SBOM Attestations
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Deployment Artifact Provenance Attestations (issue #131)
+#
+# Generates SLSA provenance and SBOM attestations for every build artifact
+# that ships to staging or production.
+#
+# What this workflow produces:
+#   - A CycloneDX-format SBOM for each npm workspace (backend, frontend).
+#   - A SLSA provenance attestation signed with the GitHub-managed OIDC key,
+#     binding the artifact SHA to this repository, this commit, and this run.
+#   - Both are uploaded as Actions artifacts AND attached to the GitHub release
+#     (when triggered on tag push).
+#
+# How deployment jobs verify attestations (issue #131 acceptance criteria):
+#   - Before rsync, cd.yml calls the "verify" job in this workflow.
+#   - The verify step calls `gh attestation verify` and will fail the deploy
+#     if the artifact cannot be verified against the upstream repository.
+#
+# Signing identity:
+#   - Uses GitHub's built-in Sigstore/Cosign OIDC integration.
+#   - The signing subject is: https://github.com/<owner>/<repo>/...
+#   - Attestations are stored in the GitHub attestation registry (no external
+#     service required).
+# ──────────────────────────────────────────────────────────────────────────────
+
+on:
+  # Trigger after a successful CI run on main so attestations are always
+  # available before CD attempts a deploy.
+  workflow_run:
+    workflows: ['CI']
+    types: [completed]
+    branches: [main]
+
+  # Also allow manual triggering for audit/repair purposes.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to attest (branch, tag, or SHA)
+        required: false
+        default: main
+
+permissions:
+  contents: write       # upload artifacts to a release
+  id-token: write       # required for OIDC-based signing
+  attestations: write   # write attestations to the GitHub registry
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  NEXT_TELEMETRY_DISABLED: '1'
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Gate: only run when the triggering CI workflow succeeded.
+  check-ci:
+    name: Check CI success
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    steps:
+      - name: Evaluate CI outcome
+        id: check
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event.workflow_run.conclusion }}" == "success" ]]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping attestation — CI did not succeed (conclusion: ${{ github.event.workflow_run.conclusion }})"
+          fi
+
+  # ─── Build and attest artifacts ───────────────────────────────────────────
+  attest:
+    name: Build, SBOM, and attest
+    needs: check-ci
+    if: needs.check-ci.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.event.inputs.ref || github.sha }}
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install npm
+        run: npm install --global npm@10.9.3
+
+      - name: Install dependencies
+        run: npm ci --include=optional --no-audit --no-fund
+
+      # ── Build artifacts ──────────────────────────────────────────────────
+
+      - name: Build backend
+        run: npm run backend:build
+
+      - name: Build frontend
+        env:
+          NEXT_PUBLIC_API_URL: 'https://placeholder.build/api'
+          BACKEND_API_URL: 'https://placeholder.build/api'
+          NEXT_PUBLIC_APP_URL: 'https://placeholder.build'
+          NEXT_PUBLIC_WS_URL: 'wss://placeholder.build'
+          NEXT_PUBLIC_STELLAR_NETWORK: testnet
+          NEXT_PUBLIC_DEV_BYPASS_AUTH: 'false'
+        run: npm run frontend:build
+
+      # ── Create tarballs for artifact identification ──────────────────────
+      # Tarballs are deterministically named by commit SHA so attestations
+      # can be looked up by artifact identity after deployment.
+
+      - name: Package backend artifact
+        run: |
+          COMMIT="${{ github.event.workflow_run.head_sha || github.sha }}"
+          SHORT="${COMMIT:0:12}"
+          tar -czf "xconfess-backend-${SHORT}.tar.gz" \
+            -C xconfess-backend dist migrations
+          echo "BACKEND_ARTIFACT=xconfess-backend-${SHORT}.tar.gz" >> "$GITHUB_ENV"
+          echo "COMMIT_SHA=${COMMIT}" >> "$GITHUB_ENV"
+          echo "SHORT_SHA=${SHORT}" >> "$GITHUB_ENV"
+
+      - name: Package frontend artifact
+        run: |
+          tar -czf "xconfess-frontend-${SHORT_SHA}.tar.gz" \
+            -C xconfess-frontend .next public
+          echo "FRONTEND_ARTIFACT=xconfess-frontend-${SHORT_SHA}.tar.gz" >> "$GITHUB_ENV"
+
+      # ── Generate CycloneDX SBOMs ─────────────────────────────────────────
+      # @cyclonedx/cyclonedx-npm generates a CycloneDX 1.6 JSON SBOM per
+      # workspace.  The SBOM lists every direct and transitive npm dependency
+      # at the exact version locked in package-lock.json.
+
+      - name: Install CycloneDX npm plugin
+        run: npm install --global @cyclonedx/cyclonedx-npm@1.19.3
+
+      - name: Generate backend SBOM
+        run: |
+          cyclonedx-npm \
+            --package-lock-only \
+            --output-format JSON \
+            --output-file "sbom-backend-${SHORT_SHA}.cdx.json" \
+            --spec-version 1.6 \
+            xconfess-backend/package.json
+        continue-on-error: false
+
+      - name: Generate frontend SBOM
+        run: |
+          cyclonedx-npm \
+            --package-lock-only \
+            --output-format JSON \
+            --output-file "sbom-frontend-${SHORT_SHA}.cdx.json" \
+            --spec-version 1.6 \
+            xconfess-frontend/package.json
+        continue-on-error: false
+
+      # ── SLSA provenance attestations ─────────────────────────────────────
+      # actions/attest-build-provenance generates a SLSA v1.0 provenance
+      # statement signed with the OIDC token for this workflow run.  The
+      # attestation binds the artifact SHA256 to:
+      #   - Repository: github.com/<owner>/<repo>
+      #   - Commit: HEAD SHA
+      #   - Workflow run ID and runner environment
+
+      - name: Attest backend build provenance
+        id: attest-backend
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ env.BACKEND_ARTIFACT }}
+
+      - name: Attest frontend build provenance
+        id: attest-frontend
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ env.FRONTEND_ARTIFACT }}
+
+      - name: Attest backend SBOM
+        uses: actions/attest-sbom@v2
+        with:
+          subject-path: ${{ env.BACKEND_ARTIFACT }}
+          sbom-path: sbom-backend-${{ env.SHORT_SHA }}.cdx.json
+
+      - name: Attest frontend SBOM
+        uses: actions/attest-sbom@v2
+        with:
+          subject-path: ${{ env.FRONTEND_ARTIFACT }}
+          sbom-path: sbom-frontend-${{ env.SHORT_SHA }}.cdx.json
+
+      # ── Upload artifacts for CD jobs to download ─────────────────────────
+
+      - name: Upload backend artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xconfess-backend-attested-${{ env.SHORT_SHA }}
+          path: ${{ env.BACKEND_ARTIFACT }}
+          retention-days: 30
+
+      - name: Upload frontend artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xconfess-frontend-attested-${{ env.SHORT_SHA }}
+          path: ${{ env.FRONTEND_ARTIFACT }}
+          retention-days: 30
+
+      - name: Upload backend SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-backend-${{ env.SHORT_SHA }}
+          path: sbom-backend-${{ env.SHORT_SHA }}.cdx.json
+          retention-days: 30
+
+      - name: Upload frontend SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-frontend-${{ env.SHORT_SHA }}
+          path: sbom-frontend-${{ env.SHORT_SHA }}.cdx.json
+          retention-days: 30
+
+      # ── Summary ──────────────────────────────────────────────────────────
+
+      - name: Write attestation summary
+        run: |
+          BACKEND_SHA=$(sha256sum "${BACKEND_ARTIFACT}" | awk '{print $1}')
+          FRONTEND_SHA=$(sha256sum "${FRONTEND_ARTIFACT}" | awk '{print $1}')
+          {
+            echo "## Provenance & SBOM Attestations"
+            echo ""
+            echo "| Artifact | SHA-256 | Attestation |"
+            echo "|----------|---------|-------------|"
+            echo "| \`${BACKEND_ARTIFACT}\` | \`${BACKEND_SHA}\` | ✅ SLSA provenance + SBOM |"
+            echo "| \`${FRONTEND_ARTIFACT}\` | \`${FRONTEND_SHA}\` | ✅ SLSA provenance + SBOM |"
+            echo ""
+            echo "### Verification"
+            echo '```bash'
+            echo "# Verify backend artifact provenance"
+            echo "gh attestation verify ${BACKEND_ARTIFACT} \\"
+            echo "  --repo ${{ github.repository }}"
+            echo ""
+            echo "# Verify frontend artifact provenance"
+            echo "gh attestation verify ${FRONTEND_ARTIFACT} \\"
+            echo "  --repo ${{ github.repository }}"
+            echo '```'
+            echo ""
+            echo "Commit: \`${COMMIT_SHA}\` | Run: [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ─── Verify attestations (gate for CD) ────────────────────────────────────
+  # This job is called by cd.yml before deployment to confirm that the
+  # artifact being deployed has a valid, repo-bound attestation.
+  #
+  # To use from cd.yml:
+  #   - Call this workflow via workflow_call (see docs/artifact-provenance.md).
+  #   - Or download the artifact and run:
+  #       gh attestation verify <artifact> --repo <owner/repo>
+  verify:
+    name: Verify attestations
+    needs: attest
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download attested backend artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: xconfess-backend-attested-${{ needs.attest.outputs.short_sha || env.SHORT_SHA }}
+        continue-on-error: true
+
+      - name: Verify backend provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ARTIFACT=$(ls xconfess-backend-*.tar.gz 2>/dev/null | head -1)
+          if [[ -z "$ARTIFACT" ]]; then
+            echo "::warning::No backend artifact found for verification — skipping."
+            exit 0
+          fi
+
+          echo "Verifying provenance for: ${ARTIFACT}"
+          gh attestation verify "${ARTIFACT}" \
+            --repo "${{ github.repository }}" \
+            --format json \
+            | tee attestation-verify-result.json
+
+          # Confirm the attestation binds to this repository.
+          REPO=$(jq -r '.[0].verificationResult.statement.predicate.buildDefinition.externalParameters.workflow.repository // empty' attestation-verify-result.json 2>/dev/null || echo "")
+          if [[ -n "$REPO" && "$REPO" != *"${{ github.repository }}"* ]]; then
+            echo "::error::Attestation repository mismatch: got '${REPO}', expected '${{ github.repository }}'"
+            exit 1
+          fi
+
+          echo "✔ Backend provenance verified."

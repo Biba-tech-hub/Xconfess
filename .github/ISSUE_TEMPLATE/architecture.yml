@@ -1,0 +1,109 @@
+name: Architecture change
+description: Propose or track a structural change to a system boundary, data model, or cross-cutting concern.
+title: "[Architecture] "
+labels: ["architecture"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template for changes that affect system boundaries, ADRs, data ownership, cross-package contracts, or major dependency decisions.
+        Before opening, check [docs/adr/README.md](https://github.com/Xconfess/Xconfess/blob/main/docs/adr/README.md) for existing decisions that may already cover this area.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One paragraph describing the architectural problem or change.
+    validations:
+      required: true
+
+  - type: textarea
+    id: affected_boundaries
+    attributes:
+      label: Affected boundaries
+      description: Which layers or components does this change touch?
+      placeholder: |
+        - Backend: e.g. confession encryption, data export
+        - Frontend: e.g. proxy routes, session handling
+        - Contracts: e.g. ABI, storage layout
+        - Cross-cutting: e.g. auth flow, data ownership
+    validations:
+      required: true
+
+  - type: textarea
+    id: options
+    attributes:
+      label: Options considered
+      description: List at least two options with trade-offs. If an ADR already documents this, link it.
+      placeholder: |
+        Option A — ...
+        Option B — ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed_decision
+    attributes:
+      label: Proposed decision
+      description: Which option do you recommend and why?
+    validations:
+      required: true
+
+  - type: textarea
+    id: consequences
+    attributes:
+      label: Consequences
+      description: Positive and negative consequences of the proposed decision, including migration effort.
+      placeholder: |
+        Positive:
+        -
+
+        Negative:
+        -
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: What is in scope and out of scope for this issue?
+      placeholder: |
+        In scope:
+        -
+
+        Out of scope:
+        -
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Testable checks a reviewer can verify locally. Include ADR, tests, and docs expectations.
+      placeholder: |
+        - [ ] ADR written or updated in docs/adr/
+        - [ ] Affected modules updated
+        - [ ] Tests added for failure paths and rollback behavior
+        - [ ] docs/ updated if behavior visible to contributors changes
+    validations:
+      required: true
+
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation
+      description: Exact commands to prove the work.
+      placeholder: |
+        npm run preflight && npm run ci
+    validations:
+      required: true
+
+  - type: textarea
+    id: adr_link
+    attributes:
+      label: Related ADR(s)
+      description: Link to any existing ADRs this change supersedes or extends.
+      placeholder: |
+        - docs/adr/00X-...

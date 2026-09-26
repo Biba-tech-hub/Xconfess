@@ -28,6 +28,50 @@ team uses `public` as the Stellar CLI alias for mainnet, commit
 `deployments/public.json`. If the team explicitly configures a `mainnet` alias,
 commit `deployments/mainnet.json` and mention the alias in the release notes.
 
+## Manifest Verification
+
+Deployment manifests are cryptographically verifiable. Each manifest records
+the exact network and build it was produced from, the checksums of every
+referenced artifact, and the provenance of the signer that produced it. A
+manifest whose artifact checksum does not match the on-disk artifact, or whose
+network/environment metadata is incompatible with the consumer, must be
+rejected.
+
+### Required Fields
+
+Every `deployments/<network>.json` manifest must include:
+
+- `network`: the Stellar network id (`testnet`, `mainnet`, or `futurenet`).
+- `environment`: the deployment environment (`development`, `staging`, or
+  `production`).
+- `contracts`: a map of contract name to `{ contract_id, wasm_sha256,
+  abi_sha256 }`. `wasm_sha256` and `abi_sha256` are lowercase hex SHA-256
+  digests of the deployed WASM and ABI artifacts.
+- `signer`: `{ public_key, signature, signed_at }` describing the deployer that
+  produced the manifest. `signature` is the deployer's signature over the
+  canonical manifest payload (all fields except `signer.signature`).
+
+### Verification
+
+Run the verification routine before consuming a manifest:
+
+```bash
+npm run contracts:verify-manifest -- --manifest deployments/testnet.json
+```
+
+Verification fails when:
+
+- a referenced artifact's SHA-256 does not match the manifest checksum
+  (tampered artifact)
+- the manifest `network`/`environment` is incompatible with the consumer's
+  expected network/environment
+- `signer` provenance is missing, malformed, or the signature does not verify
+  against the canonical manifest payload
+
+Consumers (backend services, frontend builds, CI preflight) must reject any
+manifest that fails verification rather than falling back to unverified
+contract IDs.
+
 ## What To Commit
 
 Commit:

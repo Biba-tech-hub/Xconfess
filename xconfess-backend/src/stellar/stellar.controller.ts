@@ -30,6 +30,7 @@ import {
   buildStellarInvocationAuditMetadata,
 } from './stellar-invocation-audit';
 import { redactSecretStrings } from '../utils/redact-secrets';
+import { RequestCost, COST } from '../common/guards/cost-throttler.guard';
 
 @ApiTags('Stellar')
 @Controller('stellar')
@@ -120,6 +121,7 @@ export class StellarController {
   }
 
   @Post('verify')
+  @RequestCost(COST.CHAIN) // on-chain verification — most expensive tier
   @ApiOperation({ summary: 'Verify transaction on-chain' })
   @ApiResponse({ status: 200, description: 'Transaction verification result' })
   async verifyTransaction(@Body() dto: VerifyTransactionDto, @Req() req: any) {
@@ -136,6 +138,7 @@ export class StellarController {
   }
 
   @Post('invoke-contract')
+  @RequestCost(COST.CHAIN) // Soroban contract invocation — most expensive tier
   @ApiOperation({
     summary: 'Invoke allowlisted Soroban operation (server-signed, admin)',
   })

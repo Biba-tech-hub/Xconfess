@@ -229,6 +229,70 @@ ORDER BY seq_tup_read DESC;
 | LCP | 2.5s | 3s |
 | CLS | 0.1 | 0.15 |
 
+## Per-Route Bundle & Hydration Budgets
+
+Budgets are enforced per representative route so a single heavy page cannot silently regress initial load or hydration. The values below are the source of truth for the CI budget check; keep them in sync with the budget config used by the build.
+
+### Representative Routes
+
+| Route | Initial JS (gzip) | Hydration (TBT) | Notes |
+|-------|-------------------|-----------------|-------|
+| `/` (home) | 200KB | 200ms | Marketing/landing surface |
+| `/feed` | 250KB | 300ms | Primary authenticated list |
+| `/confessions/[id]` | 250KB | 300ms | Detail view |
+| `/admin` | 350KB | 400ms | Admin panel, heavy tables |
+
+### Hydration Thresholds
+
+- **Total Blocking Time (TBT):** must stay under the per-route limit above.
+- **Long tasks during hydration:** no single task > 50ms on a representative route.
+- **Hydration mismatch:** any React hydration error fails the check.
+
+### Enforcing Budgets in CI
+
+Budgets are checked on every pull request against the representative routes above. A violation fails the job and prints the offending route, the measured value, and the budget it exceeded so the fix is actionable.
+
+```bash
+# Bundle + hydration budget check (runs in CI)
+npm run frontend:budget
+```
+
+When a route exceeds its budget, the output must include:
+- the route path,
+- the measured size/time,
+- the configured budget,
+- the largest contributing chunks or imports.
+
+### Detecting Oversized Imports
+
+Use the bundle analyzer to attribute weight to specific dependencies before optimizing:
+
+```bash
+ANALYZE=true npm run build
+```
+
+Common offenders and the fix:
+
+| Oversized import | Fix |
+|------------------|-----|
+| Stellar SDK loaded on non-wallet routes | `dynamic(() => import(...), { ssr: false })` |
+| Chart/visualization libraries | Dynamic import behind the component that renders them |
+| Admin-only tables/editors | Route-level code splitting |
+| Modal/dialog content | Dynamic import the modal body |
+
+### Dynamic Imports
+
+Use dynamic imports (code splitting) wherever a heavy dependency is not needed for the initial render of a route:
+
+```typescript
+const WalletPanel = dynamic(() => import('./WalletPanel'), {
+  loading: () => <Skeleton />,
+  ssr: false,
+});
+```
+
+Prefer splitting at the route boundary first, then at the component boundary for heavy, conditionally-rendered UI.
+
 ## Common Pitfalls
 
 ### Backend
@@ -259,6 +323,10 @@ ORDER BY seq_tup_read DESC;
    - Measure first
    - Profile before optimizing
 
+4. **Ignoring per-route budgets**
+   - A green global bundle can still hide a heavy route
+   - Check the per-route budget output before merging
+
 ## Testing Performance
 
 ### Backend Testing
@@ -282,6 +350,9 @@ npm run lighthouse
 
 # Bundle analysis
 ANALYZE=true npm run build
+
+# Bundle + hydration budget check
+npm run frontend:budget
 
 # Performance tests
 npm run test:performance

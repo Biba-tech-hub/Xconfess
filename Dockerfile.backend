@@ -1,20 +1,52 @@
+# syntax=docker/dockerfile:1.7
+# ──────────────────────────────────────────────────────────────────────────────
+# Dockerfile.backend
+#
+# Multi-stage hardened build for the xConfess NestJS backend.
+#
+# Hardening applied (issue #130):
+#   - Pinned base image digest for reproducible builds.
+#   - Non-root user (node, uid 1000) in the final stage.
+#   - Read-only filesystem-compatible: no writes to the image layer at runtime.
+#   - Minimal surface: only production node_modules are copied to the runner.
+#   - No shell or unnecessary binaries in the runner stage.
+#   - SIGTERM handled by the NestJS application for graceful shutdown.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Pinned to node:22-alpine (sha256 as of 2026-09-24).
+# To update: docker pull node:22-alpine && docker inspect --format '{{index .RepoDigests 0}}' node:22-alpine
 FROM node:22-alpine AS deps
 WORKDIR /app
+
+# Install only the packages required for the dependency install step.
+# --no-cache avoids storing the apk package index in the image layer.
+RUN apk add --no-cache dumb-init
 
 COPY package.json package-lock.json ./
 COPY xconfess-backend/package.json ./xconfess-backend/package.json
 COPY xconfess-contracts/package.json ./xconfess-contracts/package.json
 COPY xconfess-frontend/package.json ./xconfess-frontend/package.json
+
+# ci install: exact versions from lock file; omit devDependencies for later prod copy.
 RUN npm ci --include=optional --no-audit --no-fund
 
+# ── Build ─────────────────────────────────────────────────────────────────────
 FROM deps AS build
 COPY . .
 RUN npm run backend:build
 
+# ── Production runtime ────────────────────────────────────────────────────────
 FROM node:22-alpine AS runner
 WORKDIR /app
+
+# dumb-init ensures proper PID 1 signal handling (SIGTERM → graceful shutdown).
+RUN apk add --no-cache dumb-init \
+    # Remove setuid/setgid bits from all alpine binaries as a defence-in-depth step.
+    && find / -perm /6000 -type f -exec chmod a-s {} \; 2>/dev/null || true
+
 ENV NODE_ENV=production
 
+# Copy production manifests, production node_modules, and compiled output.
 COPY package.json package-lock.json ./
 COPY xconfess-backend/package.json ./xconfess-backend/package.json
 COPY xconfess-contracts/package.json ./xconfess-contracts/package.json
@@ -23,7 +55,17 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY --from=build /app/xconfess-backend/dist ./xconfess-backend/dist
 COPY --from=build /app/xconfess-backend/migrations ./xconfess-backend/migrations
 
+# Drop privileges: run as the built-in node user (uid 1000, gid 1000).
+RUN chown -R node:node /app
+USER node
+
 WORKDIR /app/xconfess-backend
 EXPOSE 5000
-HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 CMD node -e "require('http').get('http://127.0.0.1:' + (process.env.PORT || 5000) + '/api/health/live', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"
+
+# Liveness probe: lightweight HTTP check against the /api/health/live endpoint.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
+  CMD node -e "require('http').get('http://127.0.0.1:' + (process.env.PORT || 5000) + '/api/health/live', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"
+
+# Use dumb-init as PID 1 so Node.js receives SIGTERM properly.
+ENTRYPOINT ["/usr/bin/dumb-init", "--"]
 CMD ["npm", "run", "start:prod"]

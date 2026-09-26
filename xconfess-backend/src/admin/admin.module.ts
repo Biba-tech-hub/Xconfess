@@ -31,6 +31,7 @@ import { TemplatesService } from './services/templates.service';
 
 import { StellarAnchor } from '../stellar/entities/stellar-anchor.entity';
 import { SorobanEventCheckpoint } from '../stellar/entities/soroban-event-checkpoint.entity';
+import { DiagnosticsBundleService } from './services/diagnostics-bundle.service';
 
 @Module({
   imports: [
@@ -68,12 +69,14 @@ import { SorobanEventCheckpoint } from '../stellar/entities/soroban-event-checkp
     WsRolesGuard,
     Reflector,
     TemplatesService, // Added
+    DiagnosticsBundleService,
   ],
   exports: [
     AdminService, 
     ModerationService, 
     ModerationTemplateService, 
     TemplatesService, // Added
+    DiagnosticsBundleService,
   ],
 })
 export class AdminModule {}
