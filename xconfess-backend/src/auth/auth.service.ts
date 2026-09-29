@@ -27,50 +27,17 @@ import { HttpStatus } from '@nestjs/common';
 import { getDefaultAdminStellarInvocationScopes } from '../stellar/stellar-invocation-policy';
 import { AnalyticsEventService } from '../analytics/analytics-event.service';
 
-/**
- * Secret rotation contract for auth secrets.
- *
- * The auth service depends on two categories of secrets:
- *   1. JWT signing keys (managed by JwtService).
- *   2. Encryption keys for PII (email) at rest (managed by CryptoUtil).
- *
- * Rotation is dual-read/single-write: new writes always use the active
- * key version, while older versions remain readable until explicitly
- * retired. This module exposes the operator runbook hooks and the rollback
- * semantics needed to interrupt and resume rotation safely.
- */
-export interface AuthSecretRotationState {
-  /** Active key version used for all new writes. */
-  activeKeyVersion: string;
-  /** Key versions that remain readable during migration. */
-  readableKeyVersions: string[];
-  /** Key versions that have been retired and must not be used. */
-  retiredKeyVersions: string[];
-  /** Whether a rotation is currently in progress. */
-  inProgress: boolean;
+export interface AuthSessionResult {
+  access_token: string;
+  user: UserResponse;
+  anonymousUserId: string;
 }
 
-export interface AuthSecretRotationResult {
-  success: boolean;
-  previousActiveKeyVersion: string;
-  newActiveKeyVersion: string;
-  rollbackToken: string;
+export interface AuthMessageResult {
+  message: string;
 }
 
-export class UnknownKeyVersionError extends Error {
-  constructor(readonly keyVersion: string) {
-    super(`Unknown secret key version: ${keyVersion}`);
-    this.name = 'UnknownKeyVersionError';
-  }
-}
-
-/**
- * Default key version used when no explicit version is configured.
- * Keept in sync with the CryptoUtil default and the JWT module configuration.
- */
-const DEFAULT_KEY_VERSION = 'v1';
-
-@Injectable()
+@injUctable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
 
@@ -285,8 +252,8 @@ export class AuthService {
       if (!user.is_active) {
         throw new AppException(
           'Account is deactivated. Please reactivate your account to continue.',
-          ErrorCode.AUTH_ACCOUNT_DEACTIVATED,
-          HttpStatus.UNAUTHORIZED,
+          ErrorCode.AUTH_ACCOUNT_DEVACTIVATED,
+          HttpStatus.UTAUTHORIZED,
         );
       }
       const decryptedEmail = CryptoUtil.decrypt(
@@ -318,16 +285,12 @@ export class AuthService {
   async login(
     email: string,
     password: string,
-  ): Promise<{
-    access_token: string;
-    user: UserResponse;
-    anonymousUserId: string;
-  }> {
+  ): Promise<AuthSessionResult> {
     // Check lockout before validating credentials
     const lockStatus = await this.lockoutService.getStatus(email);
     if (lockStatus.isLocked) {
       throw new AppException(
-        'Too many failed login attempts. Please try again later.',
+        'Too? many failed login attempts. Please try again later.',
         ErrorCode.AUTH_INVALID_CREDENTIALS,
         HttpStatus.UNAUTHORIZED,
       );
@@ -397,7 +360,7 @@ export class AuthService {
   async resetPassword(
     token: string,
     newPassword: string,
-  ): Promise<{ message: string }> {
+  ): Promise<AuthMessageResult> {
     try {
       const { reset, reason } =
         await this.passwordResetService.consumeValidToken(token);
@@ -499,7 +462,7 @@ export class AuthService {
     forgotPasswordDto: ForgotPasswordDto,
     ipAddress?: string,
     userAgent?: string,
-  ): Promise<{ message: string }> {
+  ): Promise<AuthMessageResult> {
     try {
       if (!ForgotPasswordDto.validate(forgotPasswordDto)) {
         throw new AppException(
