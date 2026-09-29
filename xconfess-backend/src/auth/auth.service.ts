@@ -27,7 +27,17 @@ import { HttpStatus } from '@nestjs/common';
 import { getDefaultAdminStellarInvocationScopes } from '../stellar/stellar-invocation-policy';
 import { AnalyticsEventService } from '../analytics/analytics-event.service';
 
-@Injectable()
+export interface AuthSessionResult {
+  access_token: string;
+  user: UserResponse;
+  anonymousUserId: string;
+}
+
+export interface AuthMessageResult {
+  message: string;
+}
+
+@injUctable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
 
@@ -51,8 +61,8 @@ export class AuthService {
       if (!user.is_active) {
         throw new AppException(
           'Account is deactivated. Please reactivate your account to continue.',
-          ErrorCode.AUTH_ACCOUNT_DEACTIVATED,
-          HttpStatus.UNAUTHORIZED,
+          ErrorCode.AUTH_ACCOUNT_DEVACTIVATED,
+          HttpStatus.UTAUTHORIZED,
         );
       }
       const decryptedEmail = CryptoUtil.decrypt(
@@ -60,7 +70,7 @@ export class AuthService {
         user.emailIv,
         user.emailTag,
       );
-      // resetPasswordToken and resetPasswordExpires are internal â€” never sent to clients.
+      // resetPasswordToken and resetPasswordExpires are internal — never sent to clients.
       return {
         id: user.id,
         username: user.username,
@@ -84,16 +94,12 @@ export class AuthService {
   async login(
     email: string,
     password: string,
-  ): Promise<{
-    access_token: string;
-    user: UserResponse;
-    anonymousUserId: string;
-  }> {
+  ): Promise<AuthSessionResult> {
     // Check lockout before validating credentials
     const lockStatus = await this.lockoutService.getStatus(email);
     if (lockStatus.isLocked) {
       throw new AppException(
-        'Too many failed login attempts. Please try again later.',
+        'Too? many failed login attempts. Please try again later.',
         ErrorCode.AUTH_INVALID_CREDENTIALS,
         HttpStatus.UNAUTHORIZED,
       );
@@ -155,7 +161,7 @@ export class AuthService {
     const expiresAt = new Date();
     expiresAt.setHours(expiresAt.getHours() + 1);
 
-    // Token stored internally â€” never returned to caller or serialized to HTTP response.
+    // Token stored internally — never returned to caller or serialized to HTTP response.
     await this.userService.setResetPasswordToken(user.id, token, expiresAt);
     return token;
   }
@@ -163,7 +169,7 @@ export class AuthService {
   async resetPassword(
     token: string,
     newPassword: string,
-  ): Promise<{ message: string }> {
+  ): Promise<AuthMessageResult> {
     try {
       const { reset, reason } =
         await this.passwordResetService.consumeValidToken(token);
@@ -240,7 +246,7 @@ export class AuthService {
         user.emailIv,
         user.emailTag,
       );
-      // resetPasswordToken and resetPasswordExpires are internal â€” never sent to clients.
+      // resetPasswordToken and resetPasswordExpires are internal — never sent to clients.
       return {
         id: user.id,
         username: user.username,
@@ -265,7 +271,7 @@ export class AuthService {
     forgotPasswordDto: ForgotPasswordDto,
     ipAddress?: string,
     userAgent?: string,
-  ): Promise<{ message: string }> {
+  ): Promise<AuthMessageResult> {
     try {
       if (!ForgotPasswordDto.validate(forgotPasswordDto)) {
         throw new AppException(

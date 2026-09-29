@@ -17,6 +17,7 @@ import { ConfigService } from '@nestjs/config';
 import { LockoutService } from './lockout.service';
 import { StepUpService } from './step-up.service';
 import * as crypto from 'crypto';
+import { AUTH_ERROR_CODES, AUTH_MESSAGES } from './auth.contract';
 
 const hashToken = (token: string) =>
   crypto.createHash('sha256').update(token).digest('hex');
@@ -183,6 +184,7 @@ describe('Auth Integration Tests - Forgot Password Flow', () => {
       expect(forgotPasswordResult).toEqual({
         message: 'If the user exists, a password reset email has been sent.',
       });
+      expect(forgotPasswordResult).toEqual(AUTH_MESSAGES.forgotPasswordGeneric);
 
       // Verify that the email service was called
       expect(emailService.sendPasswordResetEmail).toHaveBeenCalledWith(
@@ -224,6 +226,7 @@ describe('Auth Integration Tests - Forgot Password Flow', () => {
       expect(resetPasswordResult).toEqual({
         message: 'Password has been reset successfully',
       });
+      expect(resetPasswordResult).toEqual(AUTH_MESSAGES.passwordResetSuccess);
 
       // Verify that the password was updated
       expect(userRepository.save).toHaveBeenCalledWith(
@@ -257,6 +260,12 @@ describe('Auth Integration Tests - Forgot Password Flow', () => {
           newPassword: 'newPassword123',
         }),
       ).rejects.toThrow(BadRequestException);
+      await expect(
+        authController.resetPassword({
+          token: 'invalid-token',
+          newPassword: 'newPassword123',
+        }),
+      ).rejects.toMatchObject({ response: { code: AUTH_ERROR_CODES.INVALID_RESET_TOKEN } });
     });
 
     it('should handle expired token during reset', async () => {
@@ -283,6 +292,12 @@ describe('Auth Integration Tests - Forgot Password Flow', () => {
           newPassword: 'newPassword123',
         }),
       ).rejects.toThrow(BadRequestException);
+      await expect(
+        authController.resetPassword({
+          token: 'expired-token-123',
+          newPassword: 'newPassword123',
+        }),
+      ).rejects.toMatchObject({ response: { code: AUTH_ERROR_CODES.INVALID_RESET_TOKEN } });
     });
 
     it('should handle used token during reset', async () => {
@@ -307,6 +322,12 @@ describe('Auth Integration Tests - Forgot Password Flow', () => {
           newPassword: 'newPassword123',
         }),
       ).rejects.toThrow(BadRequestException);
+      await expect(
+        authController.resetPassword({
+          token: 'used-token-123',
+          newPassword: 'newPassword123',
+        }),
+      ).rejects.toMatchObject({ response: { code: AUTH_ERROR_CODES.INVALID_RESET_TOKEN } });
     });
   });
 });
@@ -415,6 +436,7 @@ describe('AuthService Integration', () => {
       const result = await service.login('test@example.com', 'password123');
 
       expect(result).toHaveProperty('access_token');
+      expect(result).toMatchObject({ token_type: 'Bearer' });
       expect(result.user).toMatchObject({
         id: mockUser.id,
         username: mockUser.username,
@@ -438,6 +460,9 @@ describe('AuthService Integration', () => {
       await expect(
         service.login('test@example.com', 'wrongpassword'),
       ).rejects.toThrow('Invalid credentials');
+      await expect(
+        service.login('test@example.com', 'wrongpassword'),
+      ).rejects.toMatchObject({ response: { code: AUTH_ERROR_CODES.INVALID_CREDENTIALS } });
     });
   });
 
@@ -458,6 +483,7 @@ describe('AuthService Integration', () => {
       expect(result).toEqual({
         message: 'If the user exists, a password reset email has been sent.',
       });
+      expect(result).toEqual(AUTH_MESSAGES.forgotPasswordGeneric);
       expect(passwordResetService.createResetToken).toHaveBeenCalledWith(
         mockUser.id,
         undefined,
@@ -480,6 +506,7 @@ describe('AuthService Integration', () => {
       expect(result).toEqual({
         message: 'If the user exists, a password reset email has been sent.',
       });
+      expect(result).toEqual(AUTH_MESSAGES.forgotPasswordGeneric);
       expect(passwordResetService.createResetToken).not.toHaveBeenCalled();
       expect(emailService.sendPasswordResetEmail).not.toHaveBeenCalled();
     });
