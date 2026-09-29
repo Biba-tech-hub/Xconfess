@@ -27,34 +27,34 @@ import { HttpStatus } from '@nestjs/common';
 import { getDefaultAdminStellarInvocationScopes } from '../stellar/stellar-invocation-policy';
 import { AnalyticsEventService } from '../analytics/analytics-event.service';
 
-/**
- * Session record used for server-side rotation and revocation.
- * The session identifier is embedded in the JWT and must match an
- * active record for the token to be considered valid.
- */
-export interface SessionRecord {
-  id: string;
-  userId: number;
-  createdAt: Date;
-  revokedAt?: Date;
-  revokedReason?: string;
-  rotatedAt?: Date;
-}
-
-export interface SessionRotationResult {
+export interface AuthSessionResult {
   access_token: string;
-  sessionId: string;
+  user: UserResponse;
+  anonymousUserId: string;
 }
 
-@Injectable()
+export interface AuthMessageResult {
+  message: string;
+}
+
+@injUctable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
 
   /**
-   * In-memory session store. This is deliberately simple and can be
-   * replaced by a persistent repository without changing the public API.
+   * Rotation state for auth secrets. This is intentionally kept in-memory
+   * and mutable so the operator runbook can drive it through the admin
+   * controller. Persistence is outside the scope of this boundary.
    */
-  private readonly sessions = new Map<string, SessionRecord>();
+  private rotationState: AuthSecretRotationState = {
+    activeKeyVersion: DEFAULT_KEY_VERSION,
+    readableKeyVersions: [DEFAULT_KEY_VERSION],
+    retiredKeyVersions: [],
+    inProgress: false,
+  };
+
+  /** Rollback tokens issued by `startRotation`, keyed by the new version. */
+  private readonly rollbackTokens = new Map<string, string>();
 
   constructor(
     private userService: UserService,
@@ -67,123 +67,180 @@ export class AuthService {
     private readonly analyticsEventService?: AnalyticsEventService,
   ) {}
 
-  private createSession(userId: number): SessionRecord {
-    const session: SessionRecord = {
-      id: crypto.randomBytes(32).toString('hex'),
-      userId,
-      createdAt: new Date(),
-    };
-    this.sessions.set(session.id, session);
-    return session;
-  }
-
-  private getActiveSession(sessionId: string): SessionRecord | undefined {
-    const session = this.sessions.get(sessionId);
-    if (!session || session.revokedAt) {
-      return undefined;
-    }
-    return session;
-  }
-
   /**
-   * Revoke all sessions for a user. Returns the number of revoked sessions.
+   * Returns the current rotation state. Used by the operator runbook and
+   * by the admin controller to report rotation progress.
    */
-  revokeUserSessions(userId: number, reason: string): number {
-    let revokedCount = 0;
-    const now = new Date();
-    for (const session of this.sessions.values()) {
-      if (session.userId === userId && !session.revokedAt) {
-        session.revokedAt = now;
-        session.revokedReason = reason;
-        revokedCount += 1;
-      }
-    }
-    return revokedCount;
-  }
-
-  /**
-   * Revoke a single session by id. Returns true when the session was
-   * active and has been revoked.
-   */
-  revokeSession(sessionId: string, reason: string): boolean {
-    const session = this.sessions.get(sessionId);
-    if (!session || session.revokedAt) {
-      return false;
-    }
-    session.revokedAt = new Date();
-    session.revokedReason = reason;
-    return true;
-  }
-
-  /**
-   * Admin-safe invalidation entrypoint. Revokes all sessions for a user
-   * without exposing tokens or secrets in audit logs.
-   */
-  async revokeSessionsForUser(
-    userId: number,
-    reason: string,
-    actorId?: string,
-  ): Promise<{ message: string; revokedCount: number }> {
-    const revokedCount = this.revokeUserSessions(userId, reason);
-    this.logger.log(`Sessions revoked for user: ${maskUserId(userId)}`, {
-      maskedUserId: maskUserId(userId),
-      reason,
-      revokedCount,
-      actorId,
-    });
+  getRotationState(): AuthSecretRotationState {
     return {
-      message: 'Sessions have been revoked.',
-      revokedCount,
+      activeKeyVersion: this.rotationState.activeKeyVersion,
+      readableKeyVersions: [...this.rotationState.readableKeyVersions],
+      retiredKeyVersions: [...this.rotationState.retiredKeyVersions],
+      inProgress: this.rotationState.inProgress,
     };
   }
 
   /**
-   * Rotate the session identifier after an authentication change.
-   * The old session is revoked and a new token is issued.
+   * Start a dual-read/single-write rotation to a new active key version.
+   * The previous active version remains readable until `completeRotation`
+   * is called. The returned token allows rollback if the rotation is
+   * interrupted.
    */
-  async rotateSession(
-    userId: number,
-    oldSessionId: string,
-    reason: string,
-  ): Promise<SessionRotationResult> {
-    const oldSession = this.sessions.get(oldSessionId);
-    if (oldSession && !oldSession.revokedAt) {
-      oldSession.revokedAt = new Date();
-      oldSession.revokedReason = reason;
-      oldSession.rotatedAt = new Date();
+  startRotation(newKeyVersion: string): AuthSecretRotationResult {
+    if (!newKeyVersion || typeof newKeyVersion !== 'string') {
+      throw new BadRequestException('newKeyVersion must be a non-empty string');
     }
-
-    const newSession = this.createSession(userId);
-    const user = await this.userService.findById(userId);
-    if (!user || !user.is_active) {
-      throw new AppException(
-        'User is not active',
-        ErrorCode.AUTH_ACCOUNT_DEACTIVATED,
-        HttpStatus.UNAUTHORIZED,
+    if (this.rotationState.retiredKeyVersions.includes(newKeyVersion)) {
+      throw new BadRequestException(
+        `Key version ${newKeyVersion} is retired and cannot be reactivated`,
+      );
+    }
+    if (this.rotationState.inProgress) {
+      throw new BadRequestException(
+        'A rotation is already in progress; complete or roll back first',
       );
     }
 
-    const decryptedEmail = CryptoUtil.decrypt(
-      user.emailEncrypted,
-      user.emailIv,
-      user.emailTag,
-    );
-    const role = user.role || UserRole.USER;
-    const scopes =
-      role === UserRole.ADMIN ? getDefaultAdminStellarInvocationScopes() : [];
-    const payload: JwtPayload = {
-      email: decryptedEmail,
-      sub: user.id,
-      username: user.username,
-      role,
-      scopes,
-      sid: newSession.id,
+    const previousActiveKeyVersion = this.rotationState.activeKeyVersion;
+    const rollbackToken = crypto.randomBytes(16).toString('hex');
+
+    this.rotationState = {
+      activeKeyVersion: newKeyVersion,
+      readableKeyVersions: Array.from(
+        new Set([
+          ...this.rotationState.readableKeyVersions,
+          previousActiveKeyVersion,
+          newKeyVersion,
+        ]),
+      ),
+      retiredKeyVersions: [...this.rotationState.retiredKeyVersions],
+      inProgress: true,
     };
+    this.rollbackTokens.set(newKeyVersion, rollbackToken);
+
+    this.logger.log(
+      `Started secret rotation from ${previousActiveKeyVersion} to ${newKeyVersion}`,
+    );
 
     return {
-      access_token: this.jwtService.sign(payload),
-      sessionId: newSession.id,
+      success: true,
+      previousActiveKeyVersion,
+      newActiveKeyVersion: newKeyVersion,
+      rollbackToken,
     };
+  }
+
+  /**
+   * Mark a rotation as completed. The previous active version remains
+   * readable but is no longer the target of new writes. Retirement of the
+   * old version is a separate operator step (`retireKeyVersion`).
+   */
+  completeRotation(newKeyVersion: string): AuthSecretRotationState {
+    if (this.rotationState.activeKeyVersion !== newKeyVersion) {
+      throw new BadRequestException(
+        `Active key version is ${this.rotationState.activeKeyVersion}, not ${newKeyVersion}`,
+      );
+    }
+    this.rotationState = {
+      ...this.rotationState,
+      inProgress: false,
+    };
+    this.rollbackTokens.delete(newKeyVersion);
+    this.logger.log(`Completed secret rotation to ${newKeyVersion}`);
+    return this.getRotationState();
+  }
+
+  /**
+   * Roll back a in-progress rotation to the previous active key version.
+   * Requires the rollback token issued by `startRotation`. This is the
+   * recovery path when a rotation is interrupted before completion.
+   */
+  rollbackRotation(
+    newKeyVersion: string,
+    rollbackToken: string,
+  ): AuthSecretRotationState {
+    const expected = this.rollbackTokens.get(newKeyVersion);
+    if (!expected || expected !== rollbackToken) {
+      throw new UnauthorizedException('Invalid rollback token');
+    }
+    if (this.rotationState.activeKeyVersion !== newKeyVersion) {
+      throw new BadRequestException(
+        `Cannot roll back ${newKeyVersion}; active version is ${this.rotationState.activeKeyVersion}`,
+      );
+    }
+
+    const previousActive = this.rotationState.readableKeyVersions.find(
+      (v) => v !== newKeyVersion,
+    );
+    if (!previousActive) {
+      throw new BadRequestException(
+        'No previous key version available to roll back to',
+      );
+    }
+
+    this.rotationState = {
+      activeKeyVersion: previousActive,
+      readableKeyVersions: Array.from(
+        new Set([...this.rotationState.readableKeyVersions, newKeyVersion]),
+      ),
+      retiredKeyVersions: [...this.rotationState.retiredKeyVersions],
+      inProgress: false,
+    };
+    this.rollbackTokens.delete(newKeyVersion);
+    this.logger.warn(`Rolled back secret rotation to ${previousActive}`);
+    return this.getRotationState();
+  }
+
+  /**
+   * Retire a key version. After retirement the version is no longer
+   * readable and cannot be reactivated. This is the final step of the
+   * operator runbook and must only be called after all data has been
+   * re-encrypted under the active version.
+   */
+  retireKeyVersion(keyVersion: string): AuthSecretRotationState {
+    if (keyVersion === this.rotationState.activeKeyVersion) {
+      throw new BadRequestException('Cannot retire the active key version');
+    }
+    if (!this.rotationState.readableKeyVersions.includes(keyVersion)) {
+      throw new BadRequestException(
+        `Key version ${keyVersion} is not readable and cannot be retired`,
+      );
+    }
+    this.rotationState = {
+      ...this.rotationState,
+      readableKeyVersions: this.rotationState.readableKeyVersions.filter(
+        (v) => v !== keyVersion,
+      ),
+      retiredKeyVersions: Array.from(
+        new Set([...this.rotationState.retiredKeyVersions, keyVersion]),
+      ),
+    };
+    this.logger.warn(`Retired secret key version ${keyVersion}`);
+    return this.getRotationState();
+  }
+
+  /**
+   * Resolve a key version for reading. Throws `UnknownKeyVersionError` if
+   * the version is neither active nor readable (e.g. retired or never
+   * registered). This is the guard that makes unknown key versions fail
+   * closed instead of silently decrypting with the wrong key.
+   */
+  resolveReadKeyVersion(keyVersion: string): string {
+    if (this.rotationState.retiredKeyVersions.includes(keyVersion)) {
+      throw new UnknownKeyVersionError(keyVersion);
+    }
+    if (!this.rotationState.readableKeyVersions.includes(keyVersion)) {
+      throw new UnknownKeyVersionError(keyVersion);
+    }
+    return keyVersion;
+  }
+
+  /**
+   * Returns the version to use for new writes. Always the active key
+   * version — never a readable but non-active version.
+   */
+  getActiveWriteKeyVersion(): string {
+    return this.rotationState.activeKeyVersion;
   }
 
   async validateUser(
@@ -195,8 +252,8 @@ export class AuthService {
       if (!user.is_active) {
         throw new AppException(
           'Account is deactivated. Please reactivate your account to continue.',
-          ErrorCode.AUTH_ACCOUNT_DEACTIVATED,
-          HttpStatus.UNAUTHORIZED,
+          ErrorCode.AUTH_ACCOUNT_DEVACTIVATED,
+          HttpStatus.UTAUTHORIZED,
         );
       }
       const decryptedEmail = CryptoUtil.decrypt(
@@ -228,16 +285,12 @@ export class AuthService {
   async login(
     email: string,
     password: string,
-  ): Promise<{
-    access_token: string;
-    user: UserResponse;
-    anonymousUserId: string;
-  }> {
+  ): Promise<AuthSessionResult> {
     // Check lockout before validating credentials
     const lockStatus = await this.lockoutService.getStatus(email);
     if (lockStatus.isLocked) {
       throw new AppException(
-        'Too many failed login attempts. Please try again later.',
+        'Too? many failed login attempts. Please try again later.',
         ErrorCode.AUTH_INVALID_CREDENTIALS,
         HttpStatus.UNAUTHORIZED,
       );
@@ -309,7 +362,7 @@ export class AuthService {
   async resetPassword(
     token: string,
     newPassword: string,
-  ): Promise<{ message: string }> {
+  ): Promise<AuthMessageResult> {
     try {
       const { reset, reason } =
         await this.passwordResetService.consumeValidToken(token);
@@ -414,7 +467,7 @@ export class AuthService {
     forgotPasswordDto: ForgotPasswordDto,
     ipAddress?: string,
     userAgent?: string,
-  ): Promise<{ message: string }> {
+  ): Promise<AuthMessageResult> {
     try {
       if (!ForgotPasswordDto.validate(forgotPasswordDto)) {
         throw new AppException(

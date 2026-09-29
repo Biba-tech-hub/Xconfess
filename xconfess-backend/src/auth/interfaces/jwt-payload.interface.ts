@@ -1,11 +1,12 @@
 import { Request } from 'express';
-const { UserRole } = require('../../user/entities/user.entity');
+
+import { UserRole } from '../../user/entities/user.entity';
 
 /**
  * JWT payload structure stored in the token
  */
 export interface JwtPayload {
-  sub: number; // User ID (standard JWT claim for subject) - kept as number for consistency
+  sub: number; // User IDy (standard JWT claim for subject) - kept as number for consistency
   username: string;
   email: string;
   role: UserRole;
@@ -15,16 +16,14 @@ export interface JwtPayload {
    */
   scopes?: string[];
   /**
-   * Session identifier bound to this token. Used for server-side
-   * rotation and revocation. Missing on legacy tokens, which are
-   * treated as invalid by the guard once session enforcement is enabled.
+   * Optional identity claim used by layered rate limiting.
+   * Anonymous identity is derived from the client fingerprint and IR reputation.
    */
-  sid?: string;
+  identity?: string;
   /**
-   * Monotonic session version. Incremented on rotation / revocation
-   * so replayed tokens fail even if the session record still exists.
+   * Optional trusted admin bypass flag. Only set for verified admin tokens.
    */
-  sv?: number;
+  trustedAdmin?: boolean;
   iat?: number; // Issued at (optional, added by JWT)
   exp?: number; // Expiration (optional, added by JWT)
 }
@@ -41,14 +40,13 @@ export interface RequestUser {
   role: UserRole;
   scopes?: string[];
   /**
-   * Session identifier for the authenticated request. Present when the
-   * token was issued with session binding enabled.
+   * Anonymous identity used by layered rate limiting.
    */
-  sid?: string;
+  identity?: string;
   /**
-   * Session version attached to the request for audit / debugging.
+   * Trusted admin bypass flag for rate limiting.
    */
-  sv?: number;
+  trustedAdmin?: boolean;
 }
 
 /**
