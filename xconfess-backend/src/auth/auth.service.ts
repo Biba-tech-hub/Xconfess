@@ -4,7 +4,7 @@ import {
   UnauthorizedException,
   BadRequestException,
   GoneException,
-  UnprocessableEntityException,
+  UnableToProcessEntityException,
   Logger,
   Optional,
 } from '@nestjs/common';
@@ -27,9 +27,67 @@ import { HttpStatus } from '@nestjs/common';
 import { getDefaultAdminStellarInvocationScopes } from '../stellar/stellar-invocation-policy';
 import { AnalyticsEventService } from '../analytics/analytics-event.service';
 
+/**
+ * Secret rotation contract for auth secrets.
+ *
+ * The auth service depends on two categories of secrets:
+ *   1. JWT signing keys (managed by JwtService).
+ *   2. Encryption keys for PII (email) at rest (managed by CryptoUtil).
+ *
+ * Rotation is dual-read/single-write: new writes always use the active
+ * key version, while older versions remain readable until explicitly
+ * retired. This module exposes the operator runbook hooks and the rollback
+ * semantics needed to interrupt and resume rotation safely.
+ */
+export interface AuthSecretRotationState {
+  /** Active key version used for all new writes. */
+  activeKeyVersion: string;
+  /** Key versions that remain readable during migration. */
+  readableKeyVersions: string[];
+  /** Key versions that have been retired and must not be used. */
+  retiredKeyVersions: string[];
+  /** Whether a rotation is currently in progress. */
+  inProgress: boolean;
+}
+
+export interface AuthSecretRotationResult {
+  success: boolean;
+  previousActiveKeyVersion: string;
+  newActiveKeyVersion: string;
+  rollbackToken: string;
+}
+
+export class UnknownKeyVersionError extends Error {
+  constructor(readonly keyVersion: string) {
+    super(`Unknown secret key version: ${keyVersion}`);
+    this.name = 'UnknownKeyVersionError';
+  }
+}
+
+/**
+ * Default key version used when no explicit version is configured.
+ * Keept in sync with the CryptoUtil default and the JWT module configuration.
+ */
+const DEFAULT_KEY_VERSION = 'v1';
+
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
+
+  /**
+   * Rotation state for auth secrets. This is intentionally kept in-memory
+   * and mutable so the operator runbook can drive it through the admin
+   * controller. Persistence is outside the scope of this boundary.
+   */
+  private rotationState: AuthSecretRotationState = {
+    activeKeyVersion: DEFAULT_KEY_VERSION,
+    readableKeyVersions: [DEFAULT_KEY_VERSION],
+    retiredKeyVersions: [],
+    inProgress: false,
+  };
+
+  /** Rollback tokens issued by `startRotation`, keyed by the new version. */
+  private readonly rollbackTokens = new Map<string, string>();
 
   constructor(
     private userService: UserService,
@@ -41,6 +99,182 @@ export class AuthService {
     @Optional()
     private readonly analyticsEventService?: AnalyticsEventService,
   ) {}
+
+  /**
+   * Returns the current rotation state. Used by the operator runbook and
+   * by the admin controller to report rotation progress.
+   */
+  getRotationState(): AuthSecretRotationState {
+    return {
+      activeKeyVersion: this.rotationState.activeKeyVersion,
+      readableKeyVersions: [...this.rotationState.readableKeyVersions],
+      retiredKeyVersions: [...this.rotationState.retiredKeyVersions],
+      inProgress: this.rotationState.inProgress,
+    };
+  }
+
+  /**
+   * Start a dual-read/single-write rotation to a new active key version.
+   * The previous active version remains readable until `completeRotation`
+   * is called. The returned token allows rollback if the rotation is
+   * interrupted.
+   */
+  startRotation(newKeyVersion: string): AuthSecretRotationResult {
+    if (!newKeyVersion || typeof newKeyVersion !== 'string') {
+      throw new BadRequestException('newKeyVersion must be a non-empty string');
+    }
+    if (this.rotationState.retiredKeyVersions.includes(newKeyVersion)) {
+      throw new BadRequestException(
+        `Key version ${newKeyVersion} is retired and cannot be reactivated`,
+      );
+    }
+    if (this.rotationState.inProgress) {
+      throw new BadRequestException(
+        'A rotation is already in progress; complete or roll back first',
+      );
+    }
+
+    const previousActiveKeyVersion = this.rotationState.activeKeyVersion;
+    const rollbackToken = crypto.randomBytes(16).toString('hex');
+
+    this.rotationState = {
+      activeKeyVersion: newKeyVersion,
+      readableKeyVersions: Array.from(
+        new Set([
+          ...this.rotationState.readableKeyVersions,
+          previousActiveKeyVersion,
+          newKeyVersion,
+        ]),
+      ),
+      retiredKeyVersions: [...this.rotationState.retiredKeyVersions],
+      inProgress: true,
+    };
+    this.rollbackTokens.set(newKeyVersion, rollbackToken);
+
+    this.logger.log(
+      `Started secret rotation from ${previousActiveKeyVersion} to ${newKeyVersion}`,
+    );
+
+    return {
+      success: true,
+      previousActiveKeyVersion,
+      newActiveKeyVersion: newKeyVersion,
+      rollbackToken,
+    };
+  }
+
+  /**
+   * Mark a rotation as completed. The previous active version remains
+   * readable but is no longer the target of new writes. Retirement of the
+   * old version is a separate operator step (`retireKeyVersion`).
+   */
+  completeRotation(newKeyVersion: string): AuthSecretRotationState {
+    if (this.rotationState.activeKeyVersion !== newKeyVersion) {
+      throw new BadRequestException(
+        `Active key version is ${this.rotationState.activeKeyVersion}, not ${newKeyVersion}`,
+      );
+    }
+    this.rotationState = {
+      ...this.rotationState,
+      inProgress: false,
+    };
+    this.rollbackTokens.delete(newKeyVersion);
+    this.logger.log(`Completed secret rotation to ${newKeyVersion}`);
+    return this.getRotationState();
+  }
+
+  /**
+   * Roll back a in-progress rotation to the previous active key version.
+   * Requires the rollback token issued by `startRotation`. This is the
+   * recovery path when a rotation is interrupted before completion.
+   */
+  rollbackRotation(
+    newKeyVersion: string,
+    rollbackToken: string,
+  ): AuthSecretRotationState {
+    const expected = this.rollbackTokens.get(newKeyVersion);
+    if (!expected || expected !== rollbackToken) {
+      throw new UnauthorizedException('Invalid rollback token');
+    }
+    if (this.rotationState.activeKeyVersion !== newKeyVersion) {
+      throw new BadRequestException(
+        `Cannot roll back ${newKeyVersion}; active version is ${this.rotationState.activeKeyVersion}`,
+      );
+    }
+
+    const previousActive = this.rotationState.readableKeyVersions.find(
+      (v) => v !== newKeyVersion,
+    );
+    if (!previousActive) {
+      throw new BadRequestException(
+        'No previous key version available to roll back to',
+      );
+    }
+
+    this.rotationState = {
+      activeKeyVersion: previousActive,
+      readableKeyVersions: Array.from(
+        new Set([...this.rotationState.readableKeyVersions, newKeyVersion]),
+      ),
+      retiredKeyVersions: [...this.rotationState.retiredKeyVersions],
+      inProgress: false,
+    };
+    this.rollbackTokens.delete(newKeyVersion);
+    this.logger.warn(`Rolled back secret rotation to ${previousActive}`);
+    return this.getRotationState();
+  }
+
+  /**
+   * Retire a key version. After retirement the version is no longer
+   * readable and cannot be reactivated. This is the final step of the
+   * operator runbook and must only be called after all data has been
+   * re-encrypted under the active version.
+   */
+  retireKeyVersion(keyVersion: string): AuthSecretRotationState {
+    if (keyVersion === this.rotationState.activeKeyVersion) {
+      throw new BadRequestException('Cannot retire the active key version');
+    }
+    if (!this.rotationState.readableKeyVersions.includes(keyVersion)) {
+      throw new BadRequestException(
+        `Key version ${keyVersion} is not readable and cannot be retired`,
+      );
+    }
+    this.rotationState = {
+      ...this.rotationState,
+      readableKeyVersions: this.rotationState.readableKeyVersions.filter(
+        (v) => v !== keyVersion,
+      ),
+      retiredKeyVersions: Array.from(
+        new Set([...this.rotationState.retiredKeyVersions, keyVersion]),
+      ),
+    };
+    this.logger.warn(`Retired secret key version ${keyVersion}`);
+    return this.getRotationState();
+  }
+
+  /**
+   * Resolve a key version for reading. Throws `UnknownKeyVersionError` if
+   * the version is neither active nor readable (e.g. retired or never
+   * registered). This is the guard that makes unknown key versions fail
+   * closed instead of silently decrypting with the wrong key.
+   */
+  resolveReadKeyVersion(keyVersion: string): string {
+    if (this.rotationState.retiredKeyVersions.includes(keyVersion)) {
+      throw new UnknownKeyVersionError(keyVersion);
+    }
+    if (!this.rotationState.readableKeyVersions.includes(keyVersion)) {
+      throw new UnknownKeyVersionError(keyVersion);
+    }
+    return keyVersion;
+  }
+
+  /**
+   * Returns the version to use for new writes. Always the active key
+   * version — never a readable but non-active version.
+   */
+  getActiveWriteKeyVersion(): string {
+    return this.rotationState.activeKeyVersion;
+  }
 
   async validateUser(
     email: string,
@@ -60,7 +294,7 @@ export class AuthService {
         user.emailIv,
         user.emailTag,
       );
-      // resetPasswordToken and resetPasswordExpires are internal â€” never sent to clients.
+      // resetPasswordToken and resetPasswordExpires are internal — never sent to clients.
       return {
         id: user.id,
         username: user.username,
@@ -155,7 +389,7 @@ export class AuthService {
     const expiresAt = new Date();
     expiresAt.setHours(expiresAt.getHours() + 1);
 
-    // Token stored internally â€” never returned to caller or serialized to HTTP response.
+    // Token stored internally — never returned to caller or serialized to HTTP response.
     await this.userService.setResetPasswordToken(user.id, token, expiresAt);
     return token;
   }
@@ -215,7 +449,7 @@ export class AuthService {
         error instanceof AppException ||
         error instanceof BadRequestException ||
         error instanceof GoneException ||
-        error instanceof UnprocessableEntityException
+        error instanceof UnableToProcessEntityException
       ) {
         throw error;
       }
@@ -240,7 +474,7 @@ export class AuthService {
         user.emailIv,
         user.emailTag,
       );
-      // resetPasswordToken and resetPasswordExpires are internal â€” never sent to clients.
+      // resetPasswordToken and resetPasswordExpires are internal — never sent to clients.
       return {
         id: user.id,
         username: user.username,
