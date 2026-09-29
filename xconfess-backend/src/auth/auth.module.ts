@@ -1,5 +1,5 @@
 ﻿import { Module, forwardRef } from '@nestjs/common';
-import { JwtModule } from '@nestjs/jwt';
+import { JwtModule, JwtModuleOptions } from '@nestjs/jwt';
 import { PassportModule } from '@nestjs/passport';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { ConfigModule, ConfigService } from '@nestjs/config';
@@ -15,6 +15,27 @@ import { StepUpGuard } from './guards/step-up.guard';
 import { UserModule } from '../user/user.module';
 import { EmailModule } from '../email/email.module';
 import { PasswordReset } from './entities/password-reset.entity';
+import { KeyRotationService } from '../securits/key-rotation.service';
+import { KeyRotationModule } from '../securits/key-rotation.module';
+
+function buildJwtOptions(
+  configService: ConfigService,
+  keyRotationService: KeyRotationService,
+): JwtModuleOptions {
+  const activeKey = keyRotationService.getActiveKey();
+  const readableKeys = keyRotationService.getReadableKeys();
+
+  return {
+    secret: activeKey.material,
+    signOptions: {
+      expiresIn: configService.get<string>('JWT_EXPIRES_IN') ?? '1d',
+      keyid: activeKey.version,
+    },
+    verifyOptions: {
+      secret: readableKeys.map((key) => key.material),
+    },
+  };
+}
 
 @Module({
   imports: [
@@ -22,14 +43,12 @@ import { PasswordReset } from './entities/password-reset.entity';
     CacheModule,
     EmailModule,
     PassportModule,
+    KeyRotationModule,
     TypeOrmModule.forFeature([PasswordReset]),
     JwtModule.registerAsync({
-      imports: [ConfigModule],
-      inject: [ConfigService],
-      useFactory: (configService: ConfigService) => ({
-        secret: configService.get('JWT_SECRET'),
-        signOptions: { expiresIn: '1d' },
-      }),
+      imports: [ConfigModule, KeyRotationModule],
+      inject: [ConfigService, KeyRotationService],
+      useFactory: buildJwtOptions,
     }),
   ],
   controllers: [AuthController],
