@@ -12,6 +12,8 @@ import { OptionalJwtAuthGuard } from './optional-jwt-auth.guard';
 import { PasswordResetService } from './password-reset.service';
 import { StepUpService } from './step-up.service';
 import { StepUpGuard } from './guards/step-up.guard';
+import { RateLimitGuard } from './guard/rate-limit.guard';
+import { RateLimitStore } from './guard/rate-limit.store';
 import { UserModule } from '../user/user.module';
 import { EmailModule } from '../email/email.module';
 import { PasswordReset } from './entities/password-reset.entity';
@@ -60,6 +62,8 @@ function buildJwtOptions(
     StepUpService,
     StepUpGuard,
     OptionalJwtAuthGuard,
+    RateLimitStore,
+    RateLimitGuard,
   ],
   exports: [
     AuthService,
@@ -68,6 +72,8 @@ function buildJwtOptions(
     StepUpService,
     StepUpGuard,
     OptionalJwtAuthGuard,
+    RateLimitStore,
+    RateLimitGuard,
   ],
 })
 export class AuthModule {}
