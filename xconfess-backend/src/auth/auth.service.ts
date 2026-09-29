@@ -4,7 +4,7 @@ import {
   UnauthorizedException,
   BadRequestException,
   GoneException,
-  UnprocessableEntityException,
+  UnableToProcessEntityException,
   Logger,
   Optional,
 } from '@nestjs/common';
@@ -27,9 +27,34 @@ import { HttpStatus } from '@nestjs/common';
 import { getDefaultAdminStellarInvocationScopes } from '../stellar/stellar-invocation-policy';
 import { AnalyticsEventService } from '../analytics/analytics-event.service';
 
+/**
+ * Session record used for server-side rotation and revocation.
+ * The session identifier is embedded in the JWT and must match an
+ * active record for the token to be considered valid.
+ */
+export interface SessionRecord {
+  id: string;
+  userId: number;
+  createdAt: Date;
+  revokedAt?: Date;
+  revokedReason?: string;
+  rotatedAt?: Date;
+}
+
+export interface SessionRotationResult {
+  access_token: string;
+  sessionId: string;
+}
+
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
+
+  /**
+   * In-memory session store. This is deliberately simple and can be
+   * replaced by a persistent repository without changing the public API.
+   */
+  private readonly sessions = new Map<string, SessionRecord>();
 
   constructor(
     private userService: UserService,
@@ -41,6 +66,125 @@ export class AuthService {
     @Optional()
     private readonly analyticsEventService?: AnalyticsEventService,
   ) {}
+
+  private createSession(userId: number): SessionRecord {
+    const session: SessionRecord = {
+      id: crypto.randomBytes(32).toString('hex'),
+      userId,
+      createdAt: new Date(),
+    };
+    this.sessions.set(session.id, session);
+    return session;
+  }
+
+  private getActiveSession(sessionId: string): SessionRecord | undefined {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.revokedAt) {
+      return undefined;
+    }
+    return session;
+  }
+
+  /**
+   * Revoke all sessions for a user. Returns the number of revoked sessions.
+   */
+  revokeUserSessions(userId: number, reason: string): number {
+    let revokedCount = 0;
+    const now = new Date();
+    for (const session of this.sessions.values()) {
+      if (session.userId === userId && !session.revokedAt) {
+        session.revokedAt = now;
+        session.revokedReason = reason;
+        revokedCount += 1;
+      }
+    }
+    return revokedCount;
+  }
+
+  /**
+   * Revoke a single session by id. Returns true when the session was
+   * active and has been revoked.
+   */
+  revokeSession(sessionId: string, reason: string): boolean {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.revokedAt) {
+      return false;
+    }
+    session.revokedAt = new Date();
+    session.revokedReason = reason;
+    return true;
+  }
+
+  /**
+   * Admin-safe invalidation entrypoint. Revokes all sessions for a user
+   * without exposing tokens or secrets in audit logs.
+   */
+  async revokeSessionsForUser(
+    userId: number,
+    reason: string,
+    actorId?: string,
+  ): Promise<{ message: string; revokedCount: number }> {
+    const revokedCount = this.revokeUserSessions(userId, reason);
+    this.logger.log(`Sessions revoked for user: ${maskUserId(userId)}`, {
+      maskedUserId: maskUserId(userId),
+      reason,
+      revokedCount,
+      actorId,
+    });
+    return {
+      message: 'Sessions have been revoked.',
+      revokedCount,
+    };
+  }
+
+  /**
+   * Rotate the session identifier after an authentication change.
+   * The old session is revoked and a new token is issued.
+   */
+  async rotateSession(
+    userId: number,
+    oldSessionId: string,
+    reason: string,
+  ): Promise<SessionRotationResult> {
+    const oldSession = this.sessions.get(oldSessionId);
+    if (oldSession && !oldSession.revokedAt) {
+      oldSession.revokedAt = new Date();
+      oldSession.revokedReason = reason;
+      oldSession.rotatedAt = new Date();
+    }
+
+    const newSession = this.createSession(userId);
+    const user = await this.userService.findById(userId);
+    if (!user || !user.is_active) {
+      throw new AppException(
+        'User is not active',
+        ErrorCode.AUTH_ACCOUNT_DEACTIVATED,
+        HttpStatus.UNAUTHORIZED,
+      );
+    }
+
+    const decryptedEmail = CryptoUtil.decrypt(
+      user.emailEncrypted,
+      user.emailIv,
+      user.emailTag,
+    );
+    const role = user.role || UserRole.USER;
+    const scopes =
+      role === UserRole.ADMIN ? getDefaultAdminStellarInvocationScopes() : [];
+    const payload: JwtPayload = {
+      email: decryptedEmail,
+      sub: user.id,
+      username: user.username,
+      role,
+      scopes,
+      sid: newSession.id,
+    };
+
+    return {
+      access_token: this.jwtService.sign(payload),
+      sessionId: newSession.id,
+    };
+  }
 
   async validateUser(
     email: string,
@@ -60,7 +204,7 @@ export class AuthService {
         user.emailIv,
         user.emailTag,
       );
-      // resetPasswordToken and resetPasswordExpires are internal â€” never sent to clients.
+      // resetPasswordToken and resetPasswordExpires are internal — never sent to clients.
       return {
         id: user.id,
         username: user.username,
@@ -114,12 +258,14 @@ export class AuthService {
     const role = user.role || UserRole.USER;
     const scopes =
       role === UserRole.ADMIN ? getDefaultAdminStellarInvocationScopes() : [];
+    const session = this.createSession(user.id);
     const payload: JwtPayload = {
       email: user.email,
       sub: user.id,
       username: user.username,
       role,
       scopes,
+      sid: session.id,
     };
     this.analyticsEventService
       ?.record({
@@ -155,7 +301,7 @@ export class AuthService {
     const expiresAt = new Date();
     expiresAt.setHours(expiresAt.getHours() + 1);
 
-    // Token stored internally â€” never returned to caller or serialized to HTTP response.
+    // Token stored internally — never returned to caller or serialized to HTTP response.
     await this.userService.setResetPasswordToken(user.id, token, expiresAt);
     return token;
   }
@@ -201,6 +347,9 @@ export class AuthService {
 
       await this.userService.updatePassword(reset.userId, newPassword);
 
+      // Password reset invalidates all prior sessions.
+      this.revokeUserSessions(reset.userId, 'password_reset');
+
       this.logger.log(`Password reset successful`, {
         maskedUserId: maskUserId(reset.userId),
         tokenId: reset.id,
@@ -215,7 +364,7 @@ export class AuthService {
         error instanceof AppException ||
         error instanceof BadRequestException ||
         error instanceof GoneException ||
-        error instanceof UnprocessableEntityException
+        error instanceof UnableToProcessEntityException
       ) {
         throw error;
       }
@@ -240,7 +389,7 @@ export class AuthService {
         user.emailIv,
         user.emailTag,
       );
-      // resetPasswordToken and resetPasswordExpires are internal â€” never sent to clients.
+      // resetPasswordToken and resetPasswordExpires are internal — never sent to clients.
       return {
         id: user.id,
         username: user.username,

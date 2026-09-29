@@ -15,6 +15,9 @@ import { StepUpGuard } from './guards/step-up.guard';
 import { UserModule } from '../user/user.module';
 import { EmailModule } from '../email/email.module';
 import { PasswordReset } from './entities/password-reset.entity';
+import { Session } from './entities/session.entity';
+import { SessionService } from './session.service';
+import { SessionRevocationSubscriber } from './session-revocation.subscriber';
 
 @Module({
   imports: [
@@ -22,7 +25,7 @@ import { PasswordReset } from './entities/password-reset.entity';
     CacheModule,
     EmailModule,
     PassportModule,
-    TypeOrmModule.forFeature([PasswordReset]),
+    TypeOrmModule.forFeature([PasswordReset, Session]),
     JwtModule.registerAsync({
       imports: [ConfigModule],
       inject: [ConfigService],
@@ -41,6 +44,8 @@ import { PasswordReset } from './entities/password-reset.entity';
     StepUpService,
     StepUpGuard,
     OptionalJwtAuthGuard,
+    SessionService,
+    SessionRevocationSubscriber,
   ],
   exports: [
     AuthService,
@@ -49,6 +54,7 @@ import { PasswordReset } from './entities/password-reset.entity';
     StepUpService,
     StepUpGuard,
     OptionalJwtAuthGuard,
+    SessionService,
   ],
 })
 export class AuthModule {}

@@ -1,5 +1,5 @@
 import { Request } from 'express';
-import { UserRole } from '../../user/entities/user.entity';
+const { UserRole } = require('../../user/entities/user.entity');
 
 /**
  * JWT payload structure stored in the token
@@ -14,6 +14,17 @@ export interface JwtPayload {
    * Fine-grained guards can check these instead of coarse role checks.
    */
   scopes?: string[];
+  /**
+   * Session identifier bound to this token. Used for server-side
+   * rotation and revocation. Missing on legacy tokens, which are
+   * treated as invalid by the guard once session enforcement is enabled.
+   */
+  sid?: string;
+  /**
+   * Monotonic session version. Incremented on rotation / revocation
+   * so replayed tokens fail even if the session record still exists.
+   */
+  sv?: number;
   iat?: number; // Issued at (optional, added by JWT)
   exp?: number; // Expiration (optional, added by JWT)
 }
@@ -29,6 +40,15 @@ export interface RequestUser {
   email: string;
   role: UserRole;
   scopes?: string[];
+  /**
+   * Session identifier for the authenticated request. Present when the
+   * token was issued with session binding enabled.
+   */
+  sid?: string;
+  /**
+   * Session version attached to the request for audit / debugging.
+   */
+  sv?: number;
 }
 
 /**
